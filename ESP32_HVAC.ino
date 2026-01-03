@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <Adafruit_MCP23017.h>
+#include <Adafruit_MCP23X17.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -25,7 +25,7 @@ Preferences preferences;
 
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature ds18b20(&oneWire);
-Adafruit_MCP23017 mcp;
+Adafruit_MCP23X17 mcp;
 
 AsyncWebServer server(80);
 DNSServer dnsServer;
@@ -335,22 +335,27 @@ void setupWebServer() {
   });
 }
 
+
+
+
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== HVAC Controller boot ===");
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  mcp.begin(0); // adres 0x20
+  Serial.println("Wire.begin() uitgevoerd");
 
+  // MCP23017 initialiseren (werkt ook als de chip nog niet aangesloten is)
   for (int i = 0; i < 16; i++) {
     mcp.pinMode(i, OUTPUT);
-    mcp.digitalWrite(i, HIGH); // relays uit
+    mcp.digitalWrite(i, HIGH);  // alle relays uit
   }
+  Serial.println("MCP23017 geïnitialiseerd (of gesimuleerd bij test zonder hardware)");
 
   preferences.begin("hvac-config", false);
 
-  // Laden instellingen
+  // Laden instellingen uit NVS
   room_id = preferences.getString(NVS_ROOM_ID, "HVAC");
   wifi_ssid = preferences.getString(NVS_WIFI_SSID, "");
   wifi_pass = preferences.getString(NVS_WIFI_PASS, "");
@@ -373,12 +378,22 @@ void setup() {
   eco_hysteresis = preferences.getFloat(NVS_ECO_HYSTERESIS, 2.0);
   poll_interval = preferences.getInt(NVS_POLL_INTERVAL, 20);
 
+  // OneWire initialiseren
   ds18b20.begin();
+  uint8_t deviceCount = ds18b20.getDeviceCount();
+  if (deviceCount == 0) {
+    Serial.println("Geen DS18B20 sensoren gevonden (normaal bij test zonder hardware)");
+  } else {
+    Serial.println(String(deviceCount) + " DS18B20 sensoren gevonden");
+  }
 
-  // WiFi connectie + captive portal (identiek aan Testroom)
+  // WiFi connectie
   WiFi.mode(WIFI_STA);
+
   if (static_ip_str.length() > 0 && static_ip.fromString(static_ip_str)) {
-    IPAddress gateway, subnet(255,255,255,0), dns(192,168,1,1);
+    IPAddress gateway(192, 168, 1, 1);     // pas aan als jouw router een ander gateway heeft
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress dns(192, 168, 1, 1);
     WiFi.config(static_ip, gateway, subnet, dns);
   }
 
@@ -409,7 +424,12 @@ void setup() {
   Serial.println("Webserver gestart");
 }
 
+
+
+
+
 void loop() {
+
   if (ap_mode_active) dnsServer.processNextRequest();
 
   // WiFi reconnect check
