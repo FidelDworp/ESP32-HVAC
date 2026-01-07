@@ -1,11 +1,21 @@
 /* ESP32C6_HVACTEST.ino = Centrale HVAC controller voor kelder (ESP32-C6) op basis van particle sketch voor Flobecq
 Transition from Photon based to ESP32 based Home automation system. Developed together with ChatGPT & Grok in januari '26.
 Thuis bereikbaar op http://hvactest.local of http://192.168.1.36 => Andere controller: Naam (sectie DNS/MDNS) + static IP aanpassen!
-07jan26 15:50 Version 5 - Corrections
-- De HVAC controller probeert te pollen naar Room controllers waarvan de IP adressen en Bonjour namen ingevuld zijn in de /settings pagina maar slaagt er niet in.
+07jan26 22:44 Version 6: Wat nu werkt:
+✅ Settings worden correct opgeslagen (inclusief pins!)
+✅ HTTP polling naar Room controllers
+✅ JSON parsing (y en z waarden)
+✅ Relay switching op basis van heating demand
+✅ Power berekening en ventilatie percentage
+✅ Hardwired thermostaat inputs (pins 10, 11, 12)
+✅ Web interface met status overzicht
 
-FIXES:
+To do:
+- HTTP polling stability kan nog verbeterd worden
+- mDNS werkt niet 100% betrouwbaar op ESP32-C6 (maar IP adressen werken prima)
+- Overweeg poll_interval te verhogen als er connection issues zijn
 */
+
 
 // DEEL 1: Headers, Structs & Globals
 
@@ -201,19 +211,44 @@ void pollRooms() {
       HTTPClient http;
       
       String url;
-      if (circuits[i].ip.length() > 0) {
-        url = "http://" + circuits[i].ip + "/status.json";
-      } else {
-        url = "http://" + circuits[i].mdns + ".local/status.json";
-      }
+      String host;
       
-      Serial.printf("c%d: Polling %s\n", i, url.c_str());
-      Serial.print("    ");
+      if (circuits[i].ip.length() > 0) {
+        // Direct IP gebruiken
+        host = circuits[i].ip;
+        url = "http://" + circuits[i].ip + "/status.json";
+        Serial.printf("c%d: Polling %s\n", i, url.c_str());
+        Serial.print("    ");
+      } else {
+        // mDNS: probeer eerst te resolven naar IP
+        Serial.printf("c%d: Resolving %s.local ... ", i, circuits[i].mdns.c_str());
+        IPAddress resolvedIP;
+        
+        if (WiFi.hostByName((circuits[i].mdns + ".local").c_str(), resolvedIP)) {
+          // Check of we een geldig IP hebben gekregen
+          if (resolvedIP.toString() == "0.0.0.0" || resolvedIP[0] == 0) {
+            Serial.printf("FAILED (host not found)\n");
+            circuits[i].online = false;
+            circuits[i].vent_request = 0;
+            continue;
+          }
+          Serial.printf("OK -> %s\n", resolvedIP.toString().c_str());
+          host = resolvedIP.toString();
+          url = "http://" + host + "/status.json";
+          Serial.printf("c%d: Polling %s\n", i, url.c_str());
+          Serial.print("    ");
+        } else {
+          Serial.printf("FAILED (DNS error)\n");
+          circuits[i].online = false;
+          circuits[i].vent_request = 0;
+          continue;
+        }
+      }
 
       http.begin(client, url);
-      http.setTimeout(8000);  // 8 seconden timeout
-      http.setConnectTimeout(3000);  // 3 sec voor connect
-      http.setReuse(false);  // Geen connection reuse
+      http.setTimeout(8000);
+      http.setConnectTimeout(3000);
+      http.setReuse(false);
       
       int httpCode = http.GET();
 
@@ -259,7 +294,7 @@ void pollRooms() {
       
       http.end();
       client.stop();
-      delay(100);  // Kleine pauze tussen requests
+      delay(100);
     }
     
     // Relay schakelen + duty-cycle
