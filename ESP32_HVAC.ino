@@ -1,16 +1,20 @@
 /* ESP32C6_HVACTEST.ino = Centrale HVAC controller voor kelder (ESP32-C6) op basis van particle sketch voor Flobecq
 Transition from Photon based to ESP32 based Home automation system. Developed together with ChatGPT & Grok in januari '26.
 Thuis bereikbaar op http://hvactest.local of http://192.168.1.36 => Andere controller: Naam (sectie DNS/MDNS) + static IP aanpassen!
-06jan26 23:00 Version 3 - Complete Testroom styling + OTA + WiFi scan. Developed with Claude - January 2026
+07jan26 15:00 Version 4 - Circuit-centric met thermostaat inputs
 
-✅ Testroom look & feel (geel/blauw/rood kleurenschema)
-✅ OTA Update pagina
-✅ WiFi scan functionaliteit
-✅ Sensor & circuit nicknames
-✅ Responsive design
-✅ Auto-refresh homepage (5 sec)
+Component       Wijziging
+Data model      Circuit struct met alle properties
+MCP pins        7=feedback, 10-12=thermostaten
+Polling         Prioriteit: 1) Tstat, 2) HTTP
+Settings        Circuit boxen met alle velden
+Homepage        7 kolommen + totalen + status
+NVS             6 keys per circuit (x16)
+
 */
 
+
+// DEEL 1: Headers, Structs & Globals
 
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -44,13 +48,28 @@ const char* NVS_WIFI_SSID = "wifi_ssid";
 const char* NVS_WIFI_PASS = "wifi_password";
 const char* NVS_STATIC_IP = "static_ip";
 const char* NVS_CIRCUITS_NUM = "circuits_num";
-const char* NVS_CIRCUIT_NICK_BASE = "circuit_nick_";
 const char* NVS_SENSOR_NICK_BASE = "sensor_nick_";
-const char* NVS_ROOM_IP_BASE = "room_ip_";
-const char* NVS_ROOM_NAME_BASE = "room_name_";
 const char* NVS_ECO_THRESHOLD = "eco_thresh";
 const char* NVS_ECO_HYSTERESIS = "eco_hyst";
 const char* NVS_POLL_INTERVAL = "poll_interval";
+
+// Circuit struct
+struct Circuit {
+  String name;
+  String ip;
+  String mdns;
+  float power_kw;
+  bool has_tstat;
+  int tstat_pin;
+  bool online;
+  unsigned long last_seen;
+  bool heating_on;
+  int vent_request;
+  unsigned long on_time;
+  unsigned long off_time;
+  unsigned long last_change;
+  float duty_cycle;
+};
 
 // Runtime vars
 String room_id = "HVAC";
@@ -59,10 +78,8 @@ String wifi_pass = "";
 String static_ip_str = "";
 IPAddress static_ip;
 int circuits_num = 7;
-String circuit_nicknames[16];
+Circuit circuits[16];
 String sensor_nicknames[6];
-String room_ips[10];
-String room_names[10];
 float eco_threshold = 12.0;
 float eco_hysteresis = 2.0;
 int poll_interval = 20;
@@ -70,13 +87,7 @@ int poll_interval = 20;
 #define RELAY_PUMP_SCH 8
 #define RELAY_PUMP_WON 9
 
-bool circuit_on[16] = {false};
 int vent_percent = 0;
-unsigned long circuit_on_time[16] = {0};
-unsigned long circuit_off_time[16] = {0};
-unsigned long circuit_last_change[16] = {0};
-float circuit_dc[16] = {0.0};
-
 float sch_temps[6] = {-127,-127,-127,-127,-127,-127};
 float eco_temps[6] = {-127,-127,-127,-127,-127,-127};
 bool sensor_ok[6] = {false};
@@ -97,6 +108,9 @@ OneWireNg::Id sensor_addresses[6] = {
   {0x28,0x49,0xDD,0x03,0x00,0x00,0x80,0x4B},
   {0x28,0xC3,0xD6,0x03,0x00,0x00,0x80,0x1E}
 };
+
+
+// DEEL 2: Helper Functies
 
 String getFormattedDateTime() {
   time_t now; time(&now);
@@ -142,43 +156,90 @@ void readBoilerTemps() {
   eco_qtot = calculateQtot(eco_temps);
 }
 
+void checkPumpFeedback(float total_power) {
+  if (!mcp_available) return;
+  bool pump_should_be_on = (total_power > 0.01);
+  bool pump_is_on = (mcp.digitalRead(7) == LOW);
+  if (pump_should_be_on && !pump_is_on) {
+    Serial.println("ALERT: Pump should be ON but is OFF!");
+  } else if (!pump_should_be_on && pump_is_on) {
+    Serial.println("ALERT: Pump should be OFF but is ON!");
+  }
+}
+
 void pollRooms() {
   if (millis() - last_poll < (unsigned long)poll_interval * 1000) return;
   last_poll = millis();
   vent_percent = 0;
-  for (int i = 0; i < 10; i++) {
-    if (room_ips[i].length() == 0) continue;
-    HTTPClient http;
-    http.begin("http://" + room_ips[i] + "/json");
-    http.setTimeout(5000);
-    if (http.GET() == 200) {
-      DynamicJsonDocument doc(2048);
-      deserializeJson(doc, http.getString());
-      bool heating = doc["y"] | false;
-      int vent = doc["z"] | 0;
-      if (i < circuits_num && heating != circuit_on[i]) {
-        if (mcp_available) mcp.digitalWrite(i, heating ? LOW : HIGH);
-        if (heating) circuit_off_time[i] += millis() - circuit_last_change[i];
-        else circuit_on_time[i] += millis() - circuit_last_change[i];
-        circuit_last_change[i] = millis();
-        circuit_on[i] = heating;
-      }
-      if (vent > vent_percent) vent_percent = vent;
-    }
-    http.end();
-  }
-  analogWrite(VENT_FAN_PIN, map(vent_percent, 0, 100, 0, 255));
+  float total_power = 0.0;
+
   for (int i = 0; i < circuits_num; i++) {
-    unsigned long total = circuit_on_time[i] + circuit_off_time[i];
-    if (total > 0) circuit_dc[i] = 100.0 * circuit_on_time[i] / total;
+    bool heating_demand = false;
+    
+    // PRIORITEIT 1: Hardwired thermostaat
+    if (circuits[i].has_tstat && mcp_available && circuits[i].tstat_pin < 13) {
+      bool tstat_on = (mcp.digitalRead(circuits[i].tstat_pin) == LOW);
+      if (tstat_on) heating_demand = true;
+    }
+    
+    // PRIORITEIT 2: HTTP poll
+    if (circuits[i].ip.length() > 0 || circuits[i].mdns.length() > 0) {
+      HTTPClient http;
+      String url = circuits[i].ip.length() > 0 
+        ? "http://" + circuits[i].ip + "/json"
+        : "http://" + circuits[i].mdns + ".local/json";
+      http.begin(url);
+      http.setTimeout(5000);
+      if (http.GET() == 200) {
+        circuits[i].online = true;
+        circuits[i].last_seen = millis();
+        DynamicJsonDocument doc(2048);
+        deserializeJson(doc, http.getString());
+        bool room_heating = doc["y"] | false;
+        int room_vent = doc["z"] | 0;
+        if (room_heating) heating_demand = true;
+        if (room_vent > vent_percent) vent_percent = room_vent;
+        circuits[i].vent_request = room_vent;
+      } else {
+        circuits[i].online = false;
+        circuits[i].vent_request = 0;
+      }
+      http.end();
+    }
+    
+    // Relay schakelen + duty-cycle
+    if (heating_demand != circuits[i].heating_on) {
+      if (mcp_available && i < 7) {
+        mcp.digitalWrite(i, heating_demand ? LOW : HIGH);
+      }
+      if (heating_demand) {
+        circuits[i].off_time += millis() - circuits[i].last_change;
+      } else {
+        circuits[i].on_time += millis() - circuits[i].last_change;
+      }
+      circuits[i].last_change = millis();
+      circuits[i].heating_on = heating_demand;
+    }
+    
+    unsigned long total = circuits[i].on_time + circuits[i].off_time;
+    if (total > 0) {
+      circuits[i].duty_cycle = 100.0 * circuits[i].on_time / total;
+    }
+    
+    if (circuits[i].heating_on) {
+      total_power += circuits[i].power_kw;
+    }
   }
+  
+  analogWrite(VENT_FAN_PIN, map(vent_percent, 0, 100, 0, 255));
+  checkPumpFeedback(total_power);
 }
 
 void ecoPumpLogic() {
   static bool pumping = false;
   static unsigned long pump_start = 0;
   bool demand = false;
-  for (int i = 0; i < circuits_num; i++) if (circuit_on[i]) { demand = true; break; }
+  for (int i = 0; i < circuits_num; i++) if (circuits[i].heating_on) { demand = true; break; }
   if (!demand) {
     pumping = false;
     if (mcp_available) {
@@ -197,10 +258,59 @@ void ecoPumpLogic() {
   }
 }
 
+String getWifiScanJson() {
+  DynamicJsonDocument doc(4096);
+  int n = WiFi.scanNetworks();
+  JsonArray networks = doc.createNestedArray("networks");
+  for (int i = 0; i < n; i++) {
+    JsonObject net = networks.createNestedObject();
+    net["ssid"] = WiFi.SSID(i);
+    net["rssi"] = WiFi.RSSI(i);
+  }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+String getLogData() {
+  DynamicJsonDocument doc(4096);
+  doc["timestamp"] = millis() / 1000;
+  doc["eco_qtot"] = eco_qtot;
+  doc["sch_qtot"] = sch_qtot;
+  doc["vent_percent"] = vent_percent;
+  JsonArray temps = doc.createNestedArray("temperatures");
+  for (int i = 0; i < 6; i++) {
+    JsonObject t = temps.createNestedObject();
+    t["name"] = sensor_nicknames[i];
+    t["temp"] = sch_temps[i];
+    t["ok"] = sensor_ok[i];
+  }
+  JsonArray circs = doc.createNestedArray("circuits");
+  for (int i = 0; i < circuits_num; i++) {
+    JsonObject c = circs.createNestedObject();
+    c["id"] = i + 1;
+    c["name"] = circuits[i].name;
+    c["on"] = circuits[i].heating_on;
+    c["power"] = circuits[i].power_kw;
+    c["dc"] = circuits[i].duty_cycle;
+    c["online"] = circuits[i].online;
+  }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+
+// DEEL 3 - 1) Web Server functies)
 
 String getMainPage() {
+  float total_power = 0.0;
+  for (int i = 0; i < circuits_num; i++) {
+    if (circuits[i].heating_on) total_power += circuits[i].power_kw;
+  }
+  
   String html;
-  html.reserve(12000);
+  html.reserve(14000);
   html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="nl">
@@ -211,28 +321,30 @@ String getMainPage() {
   <title>)rawliteral" + room_id + R"rawliteral( Status</title>
   <style>
     body {font-family:Arial,Helvetica,sans-serif;background:#ffffff;margin:0;padding:0;}
-    .header {display:flex;background:#ffcc00;color:black;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;box-sizing:border-box;}
+    .header {display:flex;background:#ffcc00;color:black;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
     .header-left {flex:1;text-align:left;}
     .header-right {flex:1;text-align:right;font-size:15px;}
     .container {display:flex;flex-direction:row;min-height:calc(100vh - 60px);}
-    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;box-sizing:border-box;flex-shrink:0;}
-    .sidebar a {display:block;background:#336699;color:white;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;line-height:1.3;width:60px;box-sizing:border-box;margin-left:auto;margin-right:auto;}
+    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;flex-shrink:0;}
+    .sidebar a {display:block;background:#336699;color:white;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;line-height:1.3;width:60px;margin-left:auto;margin-right:auto;}
     .sidebar a:hover {background:#003366;}
     .sidebar a.active {background:#cc0000;}
-    .main {flex:1;padding:15px;overflow-y:auto;box-sizing:border-box;}
+    .main {flex:1;padding:15px;overflow-y:auto;}
     .group-title {font-size:17px;font-style:italic;font-weight:bold;color:#336699;margin:20px 0 8px 0;}
     table {width:100%;border-collapse:collapse;margin-bottom:15px;}
-    td.label {color:#336699;font-size:13px;padding:8px 5px;width:40%;border-bottom:1px solid #ddd;text-align:left;vertical-align:middle;}
+    td.label {color:#336699;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;vertical-align:middle;}
     td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;vertical-align:middle;}
     tr.header-row {background:#336699;color:white;}
     tr.header-row td {color:white;background:#336699;}
+    .status-ok {color:#00aa00;font-weight:bold;}
+    .status-na {color:#cc0000;font-weight:bold;}
     @media (max-width: 600px) {
       .container {flex-direction:column;}
       .sidebar {width:100%;border-right:none;border-bottom:3px solid #cc0000;padding:10px 0;display:flex;justify-content:center;}
       .sidebar a {width:70px;margin:0 5px;}
       .main {padding:10px;}
       .group-title {font-size:16px;margin:15px 0 6px 0;}
-      td.label {font-size:12px;padding:6px 4px;width:50%;}
+      td.label {font-size:12px;padding:6px 4px;}
       td.value {font-size:12px;padding:6px 4px;}
     }
   </style>
@@ -283,14 +395,29 @@ String getMainPage() {
 
       <div class="group-title">VERWARMINGSCIRCUITS</div>
       <table>
-        <tr class="header-row"><td class="label">#</td><td class="value">Naam</td><td class="value">State</td><td class="value">Duty-cycle</td></tr>
+        <tr class="header-row"><td class="label">#</td><td class="value">Naam</td><td class="value">Status</td><td class="value">Pomp</td><td class="value">Vermogen</td><td class="value">Vent %</td><td class="value">Duty %</td></tr>
 )rawliteral";
   
   for (int i = 0; i < circuits_num; i++) {
-    html += "<tr><td class=\"label\">" + String(i + 1) + "</td><td class=\"value\">" + circuit_nicknames[i] + "</td><td class=\"value\">" + String(circuit_on[i] ? "AAN" : "UIT") + "</td><td class=\"value\">" + String(circuit_dc[i], 1) + " %</td></tr>";
+    String status_icon = circuits[i].online ? "✓ OK" : "✗ NA!";
+    String status_class = circuits[i].online ? "status-ok" : "status-na";
+    String pump = circuits[i].heating_on ? "AAN" : "UIT";
+    String power = circuits[i].heating_on ? String(circuits[i].power_kw, 1) + " kW" : "0 kW";
+    
+    html += "<tr><td class=\"label\">" + String(i + 1) + "</td>";
+    html += "<td class=\"value\">" + circuits[i].name + "</td>";
+    html += "<td class=\"value " + status_class + "\">" + status_icon + "</td>";
+    html += "<td class=\"value\">" + pump + "</td>";
+    html += "<td class=\"value\">" + power + "</td>";
+    html += "<td class=\"value\">" + String(circuits[i].vent_request) + " %</td>";
+    html += "<td class=\"value\">" + String(circuits[i].duty_cycle, 1) + " %</td></tr>";
   }
   
   html += R"rawliteral(
+        <tr style="border-top:2px solid #336699;"><td colspan="4" class="label"><b>TOTAAL</b></td>
+        <td class="value"><b>)rawliteral" + String(total_power, 1) + " kW" + R"rawliteral(</b></td>
+        <td class="value"><b>)rawliteral" + String(vent_percent) + " %" + R"rawliteral(</b></td>
+        <td class="value"></td></tr>
       </table>
       <p style="text-align:center;margin-top:30px;"><a href="/settings" style="color:#336699;text-decoration:underline;font-size:16px;">→ Instellingen</a></p>
     </div>
@@ -299,52 +426,6 @@ String getMainPage() {
 </html>
 )rawliteral";
   return html;
-}
-
-String getLogData() {
-  DynamicJsonDocument doc(4096);
-  doc["timestamp"] = millis() / 1000;
-  doc["eco_qtot"] = eco_qtot;
-  doc["sch_qtot"] = sch_qtot;
-  doc["vent_percent"] = vent_percent;
-  doc["mcp_available"] = mcp_available;
-  doc["wifi_rssi"] = WiFi.RSSI();
-  doc["free_heap"] = (ESP.getFreeHeap() * 100) / ESP.getHeapSize();
-  
-  JsonArray temps = doc.createNestedArray("temperatures");
-  for (int i = 0; i < 6; i++) {
-    JsonObject t = temps.createNestedObject();
-    t["name"] = sensor_nicknames[i];
-    t["temp"] = sch_temps[i];
-    t["ok"] = sensor_ok[i];
-  }
-  
-  JsonArray circuits = doc.createNestedArray("circuits");
-  for (int i = 0; i < circuits_num; i++) {
-    JsonObject c = circuits.createNestedObject();
-    c["id"] = i + 1;
-    c["name"] = circuit_nicknames[i];
-    c["on"] = circuit_on[i];
-    c["dc"] = circuit_dc[i];
-  }
-  String json;
-  serializeJson(doc, json);
-  return json;
-}
-
-String getWifiScanJson() {
-  DynamicJsonDocument doc(4096);
-  int n = WiFi.scanNetworks();
-  JsonArray networks = doc.createNestedArray("networks");
-  for (int i = 0; i < n; i++) {
-    JsonObject net = networks.createNestedObject();
-    net["ssid"] = WiFi.SSID(i);
-    net["rssi"] = WiFi.RSSI(i);
-    net["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-  }
-  String json;
-  serializeJson(doc, json);
-  return json;
 }
 
 void setupWebServer() {
@@ -360,7 +441,6 @@ void setupWebServer() {
     request->send(200, "application/json", getWifiScanJson());
   });
 
-  // OTA Update page
   server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
     String html = R"rawliteral(
 <!DOCTYPE html>
@@ -368,14 +448,14 @@ void setupWebServer() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>)rawliteral" + room_id + R"rawliteral( - OTA Update</title>
+  <title>)rawliteral" + room_id + R"rawliteral( - OTA</title>
   <style>
     body {font-family:Arial,Helvetica,sans-serif;background:#ffffff;margin:0;padding:0;}
     .header {display:flex;background:#ffcc00;color:black;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
     .header-left {flex:1;text-align:left;}
     .header-right {flex:1;text-align:right;font-size:15px;}
     .container {display:flex;min-height:calc(100vh - 60px);}
-    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;box-sizing:border-box;}
+    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;}
     .sidebar a {display:block;background:#336699;color:white;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;line-height:1.3;width:60px;margin-left:auto;margin-right:auto;}
     .sidebar a:hover {background:#003366;}
     .sidebar a.active {background:#cc0000;}
@@ -413,7 +493,7 @@ void setupWebServer() {
       </form>
       <br>
       <button class="button reboot" onclick="if(confirm('ESP32 rebooten?')) location.href='/reboot'">Reboot</button>
-      <br><br><a href="/" style="color:#336699;text-decoration:underline;">← Terug naar Status</a>
+      <br><br><a href="/" style="color:#336699;text-decoration:underline;">← Terug</a>
     </div>
   </div>
 </body>
@@ -426,18 +506,15 @@ void setupWebServer() {
     bool success = !Update.hasError();
     request->send(200, "text/html", success 
       ? "<h2 style='color:#0f0'>Update succesvol!</h2><p>Rebooting...</p>" 
-      : "<h2 style='color:#f00'>Update mislukt!</h2><p>Probeer opnieuw.</p>");
+      : "<h2 style='color:#f00'>Update mislukt!</h2>");
     if (success) { delay(1000); ESP.restart(); }
   }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
     if (!index) {
-      Serial.println("\n=== OTA UPDATE GESTART ===");
+      Serial.println("\n=== OTA UPDATE ===");
       Update.begin(UPDATE_SIZE_UNKNOWN);
     }
     Update.write(data, len);
-    if (final) {
-      if (Update.end(true)) Serial.println("OTA succesvol");
-      else Serial.println("OTA fout");
-    }
+    if (final && Update.end(true)) Serial.println("OTA OK");
   });
 
   server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -446,30 +523,38 @@ void setupWebServer() {
     ESP.restart();
   });
 
-  // Settings page - DEEL 1
-  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
+
+// DEEL 3 - 2) Settings page
+
+server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
     String sensorNamesHtml = "";
     for (int i = 0; i < 6; i++) {
       sensorNamesHtml += "<label style=\"display:block;margin:6px 0;\">Sensor " + String(i + 1) + ": ";
       sensorNamesHtml += "<input type=\"text\" name=\"sensor_nick_" + String(i) + "\" value=\"" + sensor_nicknames[i] + "\" style=\"width:220px;\"></label>";
     }
     
-    String circuitNamesHtml = "";
-    for (int i = 0; i < 16; i++) {
-      circuitNamesHtml += "<label style=\"display:block;margin:6px 0;\">Circuit " + String(i + 1) + ": ";
-      circuitNamesHtml += "<input type=\"text\" name=\"circuit_nick_" + String(i) + "\" value=\"" + circuit_nicknames[i] + "\" style=\"width:220px;\"></label>";
-    }
-
-    String roomsHtml = "";
-    for (int i = 0; i < 10; i++) {
-      roomsHtml += "<tr><td class=\"label\">Room " + String(i + 1) + " IP</td>";
-      roomsHtml += "<td class=\"input\"><input type=\"text\" name=\"room_ip_" + String(i) + "\" value=\"" + room_ips[i] + "\"></td></tr>";
-      roomsHtml += "<tr><td class=\"label\">Room " + String(i + 1) + " Naam</td>";
-      roomsHtml += "<td class=\"input\"><input type=\"text\" name=\"room_name_" + String(i) + "\" value=\"" + room_names[i] + "\"></td></tr>";
+    String circuitsHtml = "";
+    for (int i = 0; i < circuits_num; i++) {
+      circuitsHtml += "<div class=\"circuit-box\">";
+      circuitsHtml += "<h4>Circuit " + String(i + 1) + "</h4>";
+      circuitsHtml += "<table class=\"form-table\">";
+      circuitsHtml += "<tr><td class=\"label\">Naam</td><td class=\"input\"><input type=\"text\" name=\"circuit_name_" + String(i) + "\" value=\"" + circuits[i].name + "\"></td></tr>";
+      circuitsHtml += "<tr><td class=\"label\">IP adres</td><td class=\"input\"><input type=\"text\" name=\"circuit_ip_" + String(i) + "\" value=\"" + circuits[i].ip + "\" placeholder=\"192.168.1.50\"></td></tr>";
+      circuitsHtml += "<tr><td class=\"label\">mDNS naam</td><td class=\"input\"><input type=\"text\" name=\"circuit_mdns_" + String(i) + "\" value=\"" + circuits[i].mdns + "\" placeholder=\"keuken\"></td></tr>";
+      circuitsHtml += "<tr><td class=\"label\">Vermogen (kW)</td><td class=\"input\"><input type=\"number\" step=\"0.001\" name=\"circuit_power_" + String(i) + "\" value=\"" + String(circuits[i].power_kw, 3) + "\"></td></tr>";
+      circuitsHtml += "<tr><td class=\"label\">Hardwired thermostaat</td><td class=\"input\">";
+      circuitsHtml += "<input type=\"checkbox\" name=\"circuit_tstat_" + String(i) + "\" value=\"1\"" + String(circuits[i].has_tstat ? " checked" : "") + "> ";
+      circuitsHtml += "Pin: <select name=\"circuit_tstat_pin_" + String(i) + "\">";
+      circuitsHtml += "<option value=\"255\"" + String(circuits[i].tstat_pin == 255 ? " selected" : "") + ">Geen</option>";
+      circuitsHtml += "<option value=\"10\"" + String(circuits[i].tstat_pin == 10 ? " selected" : "") + ">Pin 10 (ZP)</option>";
+      circuitsHtml += "<option value=\"11\"" + String(circuits[i].tstat_pin == 11 ? " selected" : "") + ">Pin 11 (EP)</option>";
+      circuitsHtml += "<option value=\"12\"" + String(circuits[i].tstat_pin == 12 ? " selected" : "") + ">Pin 12 (KK)</option>";
+      circuitsHtml += "</select></td></tr>";
+      circuitsHtml += "</table></div>";
     }
 
     String html;
-    html.reserve(16000);
+    html.reserve(20000);
     html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="nl">
@@ -483,11 +568,11 @@ void setupWebServer() {
     .header-left {flex:1;text-align:left;}
     .header-right {flex:1;text-align:right;font-size:15px;}
     .container {display:flex;flex-direction:row;min-height:calc(100vh - 60px);}
-    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;box-sizing:border-box;flex-shrink:0;}
+    .sidebar {width:80px;padding:10px 5px;background:#ffffff;border-right:3px solid #cc0000;flex-shrink:0;}
     .sidebar a {display:block;background:#336699;color:white;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;line-height:1.3;width:60px;margin-left:auto;margin-right:auto;}
     .sidebar a:hover {background:#003366;}
     .sidebar a.active {background:#cc0000;}
-    .main {flex:1;padding:20px;overflow-y:auto;box-sizing:border-box;}
+    .main {flex:1;padding:20px;overflow-y:auto;}
     .warning {background:#ffe6e6;border:2px solid #cc0000;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#990000;}
     .section-title {font-size:18px;font-weight:bold;color:#336699;margin:25px 0 10px 0;padding-bottom:5px;border-bottom:2px solid #336699;}
     .form-table {width:100%;border-collapse:collapse;margin:15px 0;}
@@ -495,6 +580,8 @@ void setupWebServer() {
     .form-table td.input {width:65%;padding:12px 8px;vertical-align:middle;}
     .form-table input[type=text], .form-table input[type=password], .form-table input[type=number], .form-table select {width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;}
     .form-table tr {border-bottom:1px solid #eee;}
+    .circuit-box {background:#f5f5f5;border:1px solid #ccc;border-radius:8px;padding:15px;margin:15px 0;}
+    .circuit-box h4 {margin:0 0 10px 0;color:#336699;}
     .submit-btn {background:#336699;color:white;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
     .submit-btn:hover {background:#003366;}
     .scan-btn {background:#336699;color:white;padding:8px 20px;border:none;border-radius:6px;font-size:14px;cursor:pointer;margin:10px 0;}
@@ -522,13 +609,12 @@ void setupWebServer() {
     <div class="main">
       <div class="warning">
         OPGEPAST: Wijzigt permanente instellingen!<br>
-        Verkeerde WiFi-instellingen kunnen de controller onbereikbaar maken!<br><br>
-        <strong>Geen WiFi verbinding?</strong> De controller start automatisch een AP:<br>
-        • Naam: HVAC-Setup<br>
-        • Ga naar http://192.168.4.1/settings om WiFi in te stellen
+        Verkeerde WiFi kan controller onbereikbaar maken!<br><br>
+        <strong>Geen WiFi?</strong> Controller start AP: HVAC-Setup<br>
+        Ga naar http://192.168.4.1/settings
       </div>
 
-      <form action="/save_settings" method="get" id="settingsForm">
+      <form action="/save_settings" method="get">
         
         <div class="section-title">WiFi Configuratie</div>
         <button type="button" class="scan-btn" onclick="scanWifi()">Scan netwerken</button>
@@ -537,7 +623,7 @@ void setupWebServer() {
             <td class="label">WiFi SSID</td>
             <td class="input">
               <select id="ssid_select" name="wifi_ssid" onchange="document.getElementById('ssid_manual').value=this.value">
-                <option value="">Selecteer netwerk...</option>
+                <option value="">Selecteer...</option>
               </select><br>
               Of handmatig: <input id="ssid_manual" type="text" name="wifi_ssid_manual" value=")rawliteral" + wifi_ssid + R"rawliteral(">
             </td>
@@ -547,8 +633,8 @@ void setupWebServer() {
             <td class="input"><input type="password" name="wifi_pass" value=")rawliteral" + wifi_pass + R"rawliteral("></td>
           </tr>
           <tr>
-            <td class="label">Static IP (optioneel)</td>
-            <td class="input"><input type="text" name="static_ip" value=")rawliteral" + static_ip_str + R"rawliteral(" placeholder="192.168.1.50 (leeg = DHCP)"></td>
+            <td class="label">Static IP</td>
+            <td class="input"><input type="text" name="static_ip" value=")rawliteral" + static_ip_str + R"rawliteral(" placeholder="leeg = DHCP"></td>
           </tr>
         </table>
 
@@ -579,13 +665,8 @@ void setupWebServer() {
         <div class="section-title">Sensor Nicknames</div>
         <div style="padding:10px;">)rawliteral" + sensorNamesHtml + R"rawliteral(</div>
 
-        <div class="section-title">Circuit Nicknames</div>
-        <div style="padding:10px;">)rawliteral" + circuitNamesHtml + R"rawliteral(</div>
-
-        <div class="section-title">Room Controllers</div>
-        <table class="form-table">
-          )rawliteral" + roomsHtml + R"rawliteral(
-        </table>
+        <div class="section-title">Verwarmingscircuits</div>
+        )rawliteral" + circuitsHtml + R"rawliteral(
 
         <div style="text-align:center;">
           <button type="submit" class="submit-btn">Opslaan & Reboot</button>
@@ -596,7 +677,7 @@ void setupWebServer() {
         function scanWifi() {
           fetch('/scan').then(r => r.json()).then(data => {
             let sel = document.getElementById('ssid_select');
-            sel.innerHTML = '<option value="">Selecteer netwerk...</option>';
+            sel.innerHTML = '<option value="">Selecteer...</option>';
             data.networks.forEach(n => {
               sel.innerHTML += '<option value="' + n.ssid + '">' + n.ssid + ' (' + n.rssi + ' dBm)</option>';
             });
@@ -612,25 +693,23 @@ void setupWebServer() {
     request->send(200, "text/html; charset=utf-8", html);
   });
 
-  // Save settings handler
   server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
-    auto arg = [&](const char* n, const String& d="") {
-      return request->hasArg(n) ? request->arg(n) : d;
-    };
-
-    String ssid_sel = arg("wifi_ssid");
-    String ssid_manual = arg("wifi_ssid_manual");
+    // WiFi
+    String ssid_sel = request->arg("wifi_ssid");
+    String ssid_manual = request->arg("wifi_ssid_manual");
     if (ssid_manual.length() > 0) preferences.putString(NVS_WIFI_SSID, ssid_manual);
     else if (ssid_sel.length() > 0) preferences.putString(NVS_WIFI_SSID, ssid_sel);
+    if (request->hasArg("wifi_pass")) preferences.putString(NVS_WIFI_PASS, request->arg("wifi_pass"));
+    preferences.putString(NVS_STATIC_IP, request->arg("static_ip"));
     
-    if (request->hasArg("wifi_pass")) preferences.putString(NVS_WIFI_PASS, arg("wifi_pass"));
-    preferences.putString(NVS_STATIC_IP, arg("static_ip", ""));
-    preferences.putString(NVS_ROOM_ID, arg("room_id", room_id));
-    preferences.putInt(NVS_CIRCUITS_NUM, arg("circuits_num", "7").toInt());
-    preferences.putFloat(NVS_ECO_THRESHOLD, arg("eco_thresh", "12.0").toFloat());
-    preferences.putFloat(NVS_ECO_HYSTERESIS, arg("eco_hyst", "2.0").toFloat());
-    preferences.putInt(NVS_POLL_INTERVAL, arg("poll_interval", "20").toInt());
-
+    // Basis
+    preferences.putString(NVS_ROOM_ID, request->arg("room_id"));
+    preferences.putInt(NVS_CIRCUITS_NUM, request->arg("circuits_num").toInt());
+    preferences.putFloat(NVS_ECO_THRESHOLD, request->arg("eco_thresh").toFloat());
+    preferences.putFloat(NVS_ECO_HYSTERESIS, request->arg("eco_hyst").toFloat());
+    preferences.putInt(NVS_POLL_INTERVAL, request->arg("poll_interval").toInt());
+    
+    // Sensors
     for (int i = 0; i < 6; i++) {
       String param = "sensor_nick_" + String(i);
       if (request->hasArg(param.c_str())) {
@@ -640,28 +719,29 @@ void setupWebServer() {
         preferences.putString((String(NVS_SENSOR_NICK_BASE) + i).c_str(), nick);
       }
     }
-
+    
+    // Circuits
     for (int i = 0; i < 16; i++) {
-      String param = "circuit_nick_" + String(i);
-      if (request->hasArg(param.c_str())) {
-        String nick = request->arg(param.c_str());
-        nick.trim();
-        if (nick.length() == 0) nick = "Circuit " + String(i + 1);
-        preferences.putString((String(NVS_CIRCUIT_NICK_BASE) + i).c_str(), nick);
+      String prefix = "circuit_";
+      if (request->hasArg((prefix + "name_" + i).c_str())) {
+        preferences.putString((prefix + "name_" + i).c_str(), request->arg((prefix + "name_" + i).c_str()));
+      }
+      if (request->hasArg((prefix + "ip_" + i).c_str())) {
+        preferences.putString((prefix + "ip_" + i).c_str(), request->arg((prefix + "ip_" + i).c_str()));
+      }
+      if (request->hasArg((prefix + "mdns_" + i).c_str())) {
+        preferences.putString((prefix + "mdns_" + i).c_str(), request->arg((prefix + "mdns_" + i).c_str()));
+      }
+      if (request->hasArg((prefix + "power_" + i).c_str())) {
+        preferences.putFloat((prefix + "power_" + i).c_str(), request->arg((prefix + "power_" + i).c_str()).toFloat());
+      }
+      bool has_tstat = request->hasArg((prefix + "tstat_" + i).c_str());
+      preferences.putBool((prefix + "tstat_" + i).c_str(), has_tstat);
+      if (request->hasArg((prefix + "tstat_pin_" + i).c_str())) {
+        preferences.putInt((prefix + "tstat_pin_" + i).c_str(), request->arg((prefix + "tstat_pin_" + i).c_str()).toInt());
       }
     }
-
-    for (int i = 0; i < 10; i++) {
-      String ip_param = "room_ip_" + String(i);
-      String name_param = "room_name_" + String(i);
-      if (request->hasArg(ip_param.c_str())) {
-        preferences.putString((String(NVS_ROOM_IP_BASE) + i).c_str(), request->arg(ip_param.c_str()));
-      }
-      if (request->hasArg(name_param.c_str())) {
-        preferences.putString((String(NVS_ROOM_NAME_BASE) + i).c_str(), request->arg(name_param.c_str()));
-      }
-    }
-
+    
     request->send(200, "text/html", "<h2 style='text-align:center;color:#336699;'>Opgeslagen! Rebooting...</h2>");
     delay(800);
     ESP.restart();
@@ -669,6 +749,10 @@ void setupWebServer() {
 
   server.begin();
 }
+
+
+// DEEL 4: Setup & Loop
+
 
 void setup() {
   Serial.begin(115200);
@@ -680,10 +764,31 @@ void setup() {
   if (mcp.begin_I2C(0x20)) {
     Serial.println("MCP23017 gevonden!");
     mcp_available = true;
-    for (int i = 0; i < 16; i++) {
+    
+    // Pins 0-6: Outputs (relays circuits)
+    for (int i = 0; i < 7; i++) {
       mcp.pinMode(i, OUTPUT);
       mcp.digitalWrite(i, HIGH);
     }
+    
+    // Pin 7: Input (pump feedback)
+    mcp.pinMode(7, INPUT_PULLUP);
+    
+    // Pins 8-9: Outputs (ECO pompen)
+    mcp.pinMode(8, OUTPUT);
+    mcp.digitalWrite(8, HIGH);
+    mcp.pinMode(9, OUTPUT);
+    mcp.digitalWrite(9, HIGH);
+    
+    // Pins 10-12: Inputs (thermostaten)
+    mcp.pinMode(10, INPUT_PULLUP);
+    mcp.pinMode(11, INPUT_PULLUP);
+    mcp.pinMode(12, INPUT_PULLUP);
+    
+    // Pins 13-15: Reserve
+    mcp.pinMode(13, INPUT_PULLUP);
+    mcp.pinMode(14, INPUT_PULLUP);
+    mcp.pinMode(15, INPUT_PULLUP);
   } else {
     Serial.println("MCP23017 niet gevonden");
     mcp_available = false;
@@ -691,69 +796,115 @@ void setup() {
 
   preferences.begin("hvac-config", false);
 
+  // Laad basis settings
   room_id = preferences.getString(NVS_ROOM_ID, "HVAC");
   wifi_ssid = preferences.getString(NVS_WIFI_SSID, "");
   wifi_pass = preferences.getString(NVS_WIFI_PASS, "");
-static_ip_str = preferences.getString(NVS_STATIC_IP, "");
-circuits_num = preferences.getInt(NVS_CIRCUITS_NUM, 7);
-circuits_num = constrain(circuits_num, 1, 16);
-for (int i = 0; i < 6; i++) {
-sensor_nicknames[i] = preferences.getString((String(NVS_SENSOR_NICK_BASE) + i).c_str(), "Sensor " + String(i + 1));
+  static_ip_str = preferences.getString(NVS_STATIC_IP, "");
+  circuits_num = preferences.getInt(NVS_CIRCUITS_NUM, 7);
+  circuits_num = constrain(circuits_num, 1, 16);
+  eco_threshold = preferences.getFloat(NVS_ECO_THRESHOLD, 12.0);
+  eco_hysteresis = preferences.getFloat(NVS_ECO_HYSTERESIS, 2.0);
+  poll_interval = preferences.getInt(NVS_POLL_INTERVAL, 20);
+
+  // Laad sensor nicknames
+  for (int i = 0; i < 6; i++) {
+    sensor_nicknames[i] = preferences.getString(
+      (String(NVS_SENSOR_NICK_BASE) + i).c_str(), 
+      "Sensor " + String(i + 1)
+    );
+  }
+
+  // Laad circuit data
+  for (int i = 0; i < 16; i++) {
+    String prefix = "circuit_";
+    circuits[i].name = preferences.getString((prefix + "name_" + i).c_str(), "Circuit " + String(i + 1));
+    circuits[i].ip = preferences.getString((prefix + "ip_" + i).c_str(), "");
+    circuits[i].mdns = preferences.getString((prefix + "mdns_" + i).c_str(), "");
+    circuits[i].power_kw = preferences.getFloat((prefix + "power_" + i).c_str(), 0.0);
+    circuits[i].has_tstat = preferences.getBool((prefix + "tstat_" + i).c_str(), false);
+    circuits[i].tstat_pin = preferences.getInt((prefix + "tstat_pin_" + i).c_str(), 255);
+    
+    // Runtime init
+    circuits[i].online = false;
+    circuits[i].heating_on = false;
+    circuits[i].vent_request = 0;
+    circuits[i].on_time = 1;
+    circuits[i].off_time = 100;
+    circuits[i].last_change = millis();
+    circuits[i].last_seen = 0;
+    circuits[i].duty_cycle = 0.0;
+  }
+
+  Serial.println("6 DS18B20 sensoren verwacht");
+
+  // WiFi setup
+  WiFi.mode(WIFI_STA);
+
+  if (static_ip_str.length() > 0 && static_ip.fromString(static_ip_str)) {
+    IPAddress gateway(192, 168, 1, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    WiFi.config(static_ip, gateway, subnet, gateway);
+    Serial.println("Static IP: " + static_ip_str);
+  }
+
+  if (wifi_ssid.length() > 0) {
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi mislukt -> AP mode");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("HVAC-Setup");
+    ap_mode_active = true;
+    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+    Serial.println("AP IP: " + WiFi.softAPIP().toString());
+  } else {
+    Serial.println("\nWiFi verbonden: " + WiFi.localIP().toString());
+  }
+
+  if (MDNS.begin(room_id.c_str())) {
+    Serial.println("mDNS: http://" + room_id + ".local");
+  }
+
+  setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
+  tzset();
+  configTzTime("CET-1CEST,M3.5.0/02,M10.5.0/03", "pool.ntp.org", "time.nist.gov");
+
+  setupWebServer();
+  Serial.println("Webserver gestart");
+  
+  // Print circuit configuratie
+  Serial.println("\n=== Circuit Configuratie ===");
+  for (int i = 0; i < circuits_num; i++) {
+    Serial.printf("Circuit %d: %s", i + 1, circuits[i].name.c_str());
+    if (circuits[i].has_tstat) {
+      Serial.printf(" [TSTAT pin %d]", circuits[i].tstat_pin);
+    }
+    if (circuits[i].ip.length() > 0) {
+      Serial.printf(" [IP: %s]", circuits[i].ip.c_str());
+    }
+    if (circuits[i].mdns.length() > 0) {
+      Serial.printf(" [mDNS: %s]", circuits[i].mdns.c_str());
+    }
+    Serial.printf(" [%.3f kW]\n", circuits[i].power_kw);
+  }
+  Serial.println("============================\n");
 }
-for (int i = 0; i < 16; i++) {
-circuit_nicknames[i] = preferences.getString((String(NVS_CIRCUIT_NICK_BASE) + i).c_str(), "Circuit " + String(i + 1));
-}
-for (int i = 0; i < 10; i++) {
-room_ips[i] = preferences.getString((String(NVS_ROOM_IP_BASE) + i).c_str(), "");
-room_names[i] = preferences.getString((String(NVS_ROOM_NAME_BASE) + i).c_str(), "Room " + String(i + 1));
-}
-eco_threshold = preferences.getFloat(NVS_ECO_THRESHOLD, 12.0);
-eco_hysteresis = preferences.getFloat(NVS_ECO_HYSTERESIS, 2.0);
-poll_interval = preferences.getInt(NVS_POLL_INTERVAL, 20);
-WiFi.mode(WIFI_STA);
-if (static_ip_str.length() > 0 && static_ip.fromString(static_ip_str)) {
-IPAddress gateway(192, 168, 1, 1);
-IPAddress subnet(255, 255, 255, 0);
-WiFi.config(static_ip, gateway, subnet, gateway);
-Serial.println("Static IP: " + static_ip_str);
-}
-if (wifi_ssid.length() > 0) {
-WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-unsigned long start = millis();
-while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-delay(500);
-Serial.print(".");
-}
-}
-if (WiFi.status() != WL_CONNECTED) {
-Serial.println("\nWiFi mislukt -> AP mode");
-WiFi.mode(WIFI_AP);
-WiFi.softAP("HVAC-Setup");
-ap_mode_active = true;
-dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-Serial.println("AP IP: " + WiFi.softAPIP().toString());
-} else {
-Serial.println("\nWiFi verbonden: " + WiFi.localIP().toString());
-}
-if (MDNS.begin(room_id.c_str())) {
-Serial.println("mDNS: http://" + room_id + ".local");
-}
-setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
-tzset();
-configTzTime("CET-1CEST,M3.5.0/02,M10.5.0/03", "pool.ntp.org", "time.nist.gov");
-setupWebServer();
-Serial.println("Webserver gestart");
-}
+
 void loop() {
-if (ap_mode_active) dnsServer.processNextRequest();
-uptime_sec = millis() / 1000;
-readBoilerTemps();
-pollRooms();
-ecoPumpLogic();
-delay(100);
+  if (ap_mode_active) dnsServer.processNextRequest();
+
+  uptime_sec = millis() / 1000;
+  readBoilerTemps();
+  pollRooms();
+  ecoPumpLogic();
+
+  delay(100);
 }
-
-
-
-
 
