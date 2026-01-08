@@ -1,6 +1,6 @@
 # ESP32-HVAC = Centrale HVAC Controller (Vervanging van Particle sketch: HVAC_Photon.cpp)
 
-**FiDel, 2 januari 2026**
+**FiDel, 8 januari 2026**
 
 Hallo allemaal,
 
@@ -36,35 +36,46 @@ De controller pollt periodiek de kamercontrollers (/json endpoint) voor:
    - Configureerbaar 1-16 kleppen (zoals pixels in Testroom).
    - Elke klep heeft hernoembare naam (default "Circuit 1" etc.).
    - Relais LOW = AAN.
+  
+   Vermogen van de circuits in Zarlardinge Schuur:
+   BandB = 1254 W
+   WASPL = 1096 W
+   INKOM = 1025 W
+   KEUK = 1018 W
+   EETPL = 916 W
+   ZITPL = 460 W
+   BADK = 832 W
 
-3. **Duty-cycle**:
+4. **Duty-cycle**:
    - Per circuit Ton/Toff bijgehouden → % berekend en getoond.
 
-4. **Boiler monitoring**:
+5. **Boiler monitoring**:
    - 12 hardcoded DS18B20 addresses.
-   - Qtot berekening voor SCH en ECO (placeholder-formule, later kalibreren).
+   - Qtot berekening voor kelder boiler (placeholder-formule, later kalibreren).
 
-5. **ECO-overpompen**:
+6. **ECO-overpompen**:
    - Automatisch als ECO Qtot > threshold (default 12 kWh) en er is verwarmingsvraag.
    - Hysteresis en max 5 min pomptijd.
    - Prioriteit SCH.
 
-6. **Ventilatie**:
+7. **Ventilatie**:
    - Max vent_percent van alle kamers → PWM op GPIO20.
 
-7. **Webinterface**:
+8. **Webinterface**:
    - Hoofdpagina: status boilers, ventilatie, circuits (state + duty-cycle)
-   - /settings: alle configuratie (namen, IP's rooms, thresholds, etc.) → persistent in NVS
-   - /logdata: JSON voor Google Sheets pull (elke 10 min)
+   - /settings: alle configuratie (namen, IP's rooms, thresholds, etc.)
+     → persistent in NVS
+   - /logdata: JSON voor Google Sheets push of pull (elke 10 min)
 
-8. **Toekomst**:
+9. **Toekomst**:
    - Matter integratie (switches voor kleppen/pompen, fan voor ventilatie)
 
 ### Hardware
 
 - ESP32-C6 devboard
 - MCP23017 (adres 0x20) voor relays + Thermostats
-  => 3 circuits met hardwired TSTAT: Pin 10 = Zitplaats, Pin 11 = Eetplaats, Pin 12 = Keuken.
+  => 3 circuits met hardwired TSTAT:
+     Pin 10 = Zitplaats, Pin 11 = Eetplaats, Pin 12 = Keuken.
 - OneWire bus op GPIO3 (12 DS18B20)
 - PWM ventilatie op GPIO20 → externe 0-10V converter
 - I2C op GPIO13 (SDA) / GPIO11 (SCL)
@@ -72,7 +83,7 @@ De controller pollt periodiek de kamercontrollers (/json endpoint) voor:
 ### Installatie
 
 1. Flash de sketch.
-2. Eerste boot → AP "HVAC-Setup" → configureer WiFi.
+2. Eerste boot → verbind met AP "HVAC-Setup" → configureer WiFi (RSSI, PW).
 3. Ga naar http://hvac.local/settings → vul room IP's/mDNS, circuitnamen, etc.
 4. Save → reboot → klaar!
  
@@ -128,7 +139,7 @@ override_active, override_state, override_remaining
 ------------------------
 
 To do DRINGEND:
-- Endpoint /status.json wordt niet meer bereikt! Werkte in vorige versie wel!
+- 
 
 To do Later:
 - HTTP polling stability kan nog verbeterd worden
