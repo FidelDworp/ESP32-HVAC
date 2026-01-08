@@ -1,16 +1,56 @@
 /* ESP32C6_HVACTEST.ino = Centrale HVAC controller voor kelder (ESP32-C6) op basis van particle sketch voor Flobecq
 Transition from Photon based to ESP32 based Home automation system. Developed together with ChatGPT & Grok in januari '26.
 Thuis bereikbaar op http://hvactest.local of http://192.168.1.36 => Andere controller: Naam (sectie DNS/MDNS) + static IP aanpassen!
-07jan26 22:44 Version 6: Wat nu werkt:
-✅ Settings worden correct opgeslagen (inclusief pins!)
-✅ HTTP polling naar Room controllers
-✅ JSON parsing (y en z waarden)
-✅ Relay switching op basis van heating demand
-✅ Power berekening en ventilatie percentage
-✅ Hardwired thermostaat inputs (pins 10, 11, 12)
-✅ Web interface met status overzicht
+08jan26 10:00 Version 17: Wat nu werkt:
 
-To do:
+1. Circuit Struct Uitgebreid
+
+Room controller data: setpoint, room_temp, heat_request, home_status
+Override systeem: override_active, override_state, override_start
+
+2. Intelligente Beslissings Logica (in pollRooms())
+Prioriteit volgorde:
+PRIO 0: Manual Override (1 uur) → FORCE ON/OFF
+PRIO 1: Hardwired TSTAT → Input
+PRIO 2: HTTP Poll → Parse aa, h, y, af, z
+PRIO 3: Beslissing:
+  - OFFLINE → TSTAT only
+  - ONLINE + HOME (af=1) → TSTAT OR HTTP
+  - ONLINE + AWAY (af=0) → HTTP only
+
+3. Complete Dashboard
+Nieuwe tabel met 14 kolommen:
+
+INPUT: #, Naam, IP, mDNS, Set, Temp, Heat, Home
+OUTPUT: TSTAT, Pomp, P, Duty, Vent
+CONTROL: Override (ON/OFF knoppen + countdown timer)
+
+Features:
+
+✅ Horizontaal scrollbaar op mobile
+✅ Override badge met live countdown (45:23)
+✅ Rode rand bij actieve override
+✅ ⚠️ waarschuwing in Pomp kolom
+✅ Kleurcodering: Groen (Thuis), Oranje (Away), Rood (NA/offline)
+
+4. Override Endpoints
+
+/circuit_override_on?circuit=N → Force ON
+/circuit_override_off?circuit=N → Force OFF
+/circuit_override_cancel?circuit=N → Annuleren
+
+5. JSON API Uitgebreid
+/json endpoint bevat nu ook:
+
+setpoint, room_temp, heat_request, home_status
+override_active, override_state, override_remaining
+
+------------------------
+
+To do DRINGEND:
+- Endpoint /status.json wordt niet meer bereikt! Werkte in vorige versie wel!
+
+To do Later:
 - HTTP polling stability kan nog verbeterd worden
 - mDNS werkt niet 100% betrouwbaar op ESP32-C6 (maar IP adressen werken prima)
 - Overweeg poll_interval te verhogen als er connection issues zijn
@@ -72,6 +112,17 @@ struct Circuit {
   unsigned long off_time;
   unsigned long last_change;
   float duty_cycle;
+  
+  // Room controller data (from JSON)
+  int setpoint;           // aa: heating setpoint
+  float room_temp;        // h: DS18B20 temp
+  bool heat_request;      // y: heating demand from room
+  int home_status;        // af: 0=Away, 1=Home
+  
+  // Manual override system
+  bool override_active;
+  bool override_state;    // true=FORCE ON, false=FORCE OFF
+  unsigned long override_start;
 };
 
 // Runtime vars
@@ -194,54 +245,77 @@ void pollRooms() {
 
   vent_percent = 0;
   float total_power = 0.0;
+  const unsigned long OVERRIDE_TIMEOUT = 3600000UL; // 1 uur in ms
 
   for (int i = 0; i < circuits_num; i++) {
+    // Declareer alle variabelen bovenaan (voor goto)
     bool heating_demand = false;
+    bool tstat_demand = false;
+    bool http_demand = false;
+    int home_status = 0; // 0=Away, 1=Home
     
-    // PRIORITEIT 1: Hardwired thermostaat
+    // ========================================
+    // PRIORITEIT 0: MANUAL OVERRIDE (HOOGSTE)
+    // ========================================
+    if (circuits[i].override_active) {
+      unsigned long elapsed = millis() - circuits[i].override_start;
+      if (elapsed < OVERRIDE_TIMEOUT) {
+        heating_demand = circuits[i].override_state;
+        unsigned long remaining = (OVERRIDE_TIMEOUT - elapsed) / 1000; // seconden
+        Serial.printf("c%d: ⚠️ OVERRIDE %s (%lu:%02lu remaining)\n", 
+          i, 
+          circuits[i].override_state ? "FORCE ON" : "FORCE OFF",
+          remaining / 60, remaining % 60);
+        goto apply_relay; // Skip rest van logica
+      } else {
+        // Timeout bereikt
+        circuits[i].override_active = false;
+        Serial.printf("c%d: Override timeout - terug naar AUTO\n", i);
+      }
+    }
+    
+    // ========================================
+    // PRIORITEIT 1: Hardwired Thermostaat
+    // ========================================
     if (circuits[i].has_tstat && mcp_available && circuits[i].tstat_pin < 13) {
       bool tstat_on = (mcp.digitalRead(circuits[i].tstat_pin) == LOW);
       Serial.printf("c%d: TSTAT pin %d = %s\n", i, circuits[i].tstat_pin, tstat_on ? "ON" : "OFF");
-      if (tstat_on) heating_demand = true;
+      tstat_demand = tstat_on;
     }
     
-    // PRIORITEIT 2: HTTP poll
+    // ========================================
+    // PRIORITEIT 2: HTTP Poll (Room Controller)
+    // ========================================
+    
     if (circuits[i].ip.length() > 0 || circuits[i].mdns.length() > 0) {
       WiFiClient client;
       HTTPClient http;
       
       String url;
-      String host;
-      
       if (circuits[i].ip.length() > 0) {
-        // Direct IP gebruiken
-        host = circuits[i].ip;
         url = "http://" + circuits[i].ip + "/status.json";
         Serial.printf("c%d: Polling %s\n", i, url.c_str());
         Serial.print("    ");
       } else {
-        // mDNS: probeer eerst te resolven naar IP
         Serial.printf("c%d: Resolving %s.local ... ", i, circuits[i].mdns.c_str());
         IPAddress resolvedIP;
         
         if (WiFi.hostByName((circuits[i].mdns + ".local").c_str(), resolvedIP)) {
-          // Check of we een geldig IP hebben gekregen
           if (resolvedIP.toString() == "0.0.0.0" || resolvedIP[0] == 0) {
             Serial.printf("FAILED (host not found)\n");
             circuits[i].online = false;
             circuits[i].vent_request = 0;
-            continue;
+            goto decision_logic; // Skip HTTP, ga naar beslissing
           }
           Serial.printf("OK -> %s\n", resolvedIP.toString().c_str());
-          host = resolvedIP.toString();
-          url = "http://" + host + "/status.json";
+          url = "http://" + resolvedIP.toString() + "/status.json";
           Serial.printf("c%d: Polling %s\n", i, url.c_str());
           Serial.print("    ");
         } else {
           Serial.printf("FAILED (DNS error)\n");
           circuits[i].online = false;
           circuits[i].vent_request = 0;
-          continue;
+          goto decision_logic;
         }
       }
 
@@ -265,16 +339,26 @@ void pollRooms() {
         DeserializationError error = deserializeJson(doc, payload);
         
         if (!error) {
+          // Parse room controller data
           int y_val = doc["y"] | 0;
           int z_val = doc["z"] | 0;
-          bool room_heating = (y_val == 1);
-          int room_vent = z_val;
+          int aa_val = doc["aa"] | 0;
+          float h_val = doc["h"] | 0.0;
+          int af_val = doc["af"] | 0;
           
-          Serial.printf("    y=%d z=%d => heating=%d vent=%d\n", y_val, z_val, room_heating, room_vent);
+          circuits[i].heat_request = (y_val == 1);
+          circuits[i].vent_request = z_val;
+          circuits[i].setpoint = aa_val;
+          circuits[i].room_temp = h_val;
+          circuits[i].home_status = af_val;
           
-          if (room_heating) heating_demand = true;
-          if (room_vent > vent_percent) vent_percent = room_vent;
-          circuits[i].vent_request = room_vent;
+          http_demand = circuits[i].heat_request;
+          home_status = circuits[i].home_status;
+          
+          Serial.printf("    y=%d z=%d aa=%d h=%.1f af=%d\n", 
+            y_val, z_val, aa_val, h_val, af_val);
+          
+          if (z_val > vent_percent) vent_percent = z_val;
         } else {
           Serial.printf("    JSON parse error: %s\n", error.c_str());
         }
@@ -297,7 +381,34 @@ void pollRooms() {
       delay(100);
     }
     
-    // Relay schakelen + duty-cycle
+    // ========================================
+    // BESLISSING LOGICA
+    // ========================================
+    decision_logic:
+    
+    if (!circuits[i].online) {
+      // OFFLINE: alleen thermostaat actief
+      heating_demand = tstat_demand;
+      Serial.printf("c%d: OFFLINE → TSTAT only = %s\n", i, heating_demand ? "ON" : "OFF");
+    } else {
+      // ONLINE: check home/away status
+      if (home_status == 1) {
+        // THUIS: beide systemen kunnen triggeren
+        heating_demand = tstat_demand || http_demand;
+        Serial.printf("c%d: HOME → TSTAT(%d) OR HTTP(%d) = %s\n", 
+          i, tstat_demand, http_demand, heating_demand ? "ON" : "OFF");
+      } else {
+        // AWAY: alleen room controller
+        heating_demand = http_demand;
+        Serial.printf("c%d: AWAY → HTTP only = %s\n", i, heating_demand ? "ON" : "OFF");
+      }
+    }
+    
+    // ========================================
+    // RELAY SCHAKELEN + DUTY CYCLE
+    // ========================================
+    apply_relay:
+    
     if (heating_demand != circuits[i].heating_on) {
       Serial.printf("c%d: Relay %s -> %s\n", i, 
         circuits[i].heating_on ? "ON" : "OFF",
@@ -385,10 +496,29 @@ String getLogData() {
     JsonObject c = circs.createNestedObject();
     c["id"] = i + 1;
     c["name"] = circuits[i].name;
-    c["on"] = circuits[i].heating_on;
-    c["power"] = circuits[i].power_kw;
-    c["dc"] = circuits[i].duty_cycle;
     c["online"] = circuits[i].online;
+    c["heating_on"] = circuits[i].heating_on;
+    c["power_kw"] = circuits[i].power_kw;
+    c["duty_cycle"] = circuits[i].duty_cycle;
+    c["vent_request"] = circuits[i].vent_request;
+    
+    // Room controller data
+    if (circuits[i].online) {
+      c["setpoint"] = circuits[i].setpoint;
+      c["room_temp"] = circuits[i].room_temp;
+      c["heat_request"] = circuits[i].heat_request;
+      c["home_status"] = circuits[i].home_status;
+    }
+    
+    // Override status
+    if (circuits[i].override_active) {
+      c["override_active"] = true;
+      c["override_state"] = circuits[i].override_state;
+      unsigned long remaining = (3600000UL - (millis() - circuits[i].override_start)) / 1000;
+      c["override_remaining"] = remaining;
+    } else {
+      c["override_active"] = false;
+    }
   }
   String json;
   serializeJson(doc, json);
@@ -405,14 +535,13 @@ String getMainPage() {
   }
   
   String html;
-  html.reserve(14000);
+  html.reserve(24000);
   html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="nl">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="5">
   <title>)rawliteral" + room_id + R"rawliteral( Status</title>
   <style>
     body {font-family:Arial,Helvetica,sans-serif;background:#ffffff;margin:0;padding:0;}
@@ -426,28 +555,52 @@ String getMainPage() {
     .sidebar a.active {background:#cc0000;}
     .main {flex:1;padding:15px;overflow-y:auto;}
     .group-title {font-size:17px;font-style:italic;font-weight:bold;color:#336699;margin:20px 0 8px 0;}
-    table {width:100%;border-collapse:collapse;margin-bottom:15px;}
+    
+    .refresh-btn {
+      background:#336699;color:white;padding:10px 20px;border:none;
+      border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;
+      margin:10px 0;
+    }
+    .refresh-btn:hover {background:#003366;}
+    
+    .circuits-table-wrapper {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      width: 100%;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      margin: 15px 0;
+    }
+    
+    table {width:100%;border-collapse:collapse;margin-bottom:15px;min-width:1400px;}
     td.label {color:#336699;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;vertical-align:middle;}
-    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;vertical-align:middle;}
+    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;vertical-align:middle;white-space:nowrap;}
     tr.header-row {background:#336699;color:white;}
-    tr.header-row td {color:white;background:#336699;}
+    tr.header-row td {color:white;background:#336699;font-weight:bold;padding:10px 5px;}
+    tr.override-active {border-left:4px solid #cc0000;}
     .status-ok {color:#00aa00;font-weight:bold;}
     .status-na {color:#cc0000;font-weight:bold;}
+    .status-away {color:#ff8800;font-weight:bold;}
+    .btn-override {padding:4px 8px;margin:2px;font-size:11px;cursor:pointer;border:none;border-radius:4px;background:#336699;color:white;}
+    .btn-override:hover {background:#003366;}
+    .btn-override:disabled {background:#ccc;cursor:not-allowed;}
+    .btn-override-cancel {background:#cc0000;}
+    .btn-override-cancel:hover {background:#990000;}
+    .override-badge {background:#cc0000;color:white;padding:4px 8px;border-radius:4px;font-size:11px;font-weight:bold;}
+    
     @media (max-width: 600px) {
       .container {flex-direction:column;}
       .sidebar {width:100%;border-right:none;border-bottom:3px solid #cc0000;padding:10px 0;display:flex;justify-content:center;}
       .sidebar a {width:70px;margin:0 5px;}
       .main {padding:10px;}
       .group-title {font-size:16px;margin:15px 0 6px 0;}
-      td.label {font-size:12px;padding:6px 4px;}
-      td.value {font-size:12px;padding:6px 4px;}
     }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="header-left">)rawliteral" + room_id + R"rawliteral(</div>
-    <div class="header-right">)rawliteral" + String(uptime_sec) + " s &nbsp;&nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
+    <div class="header-right" id="header-time">)rawliteral" + String(uptime_sec) + " s &nbsp;&nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
   </div>
   <div class="container">
     <div class="sidebar">
@@ -457,6 +610,8 @@ String getMainPage() {
       <a href="/settings">Settings</a>
     </div>
     <div class="main">
+      <button class="refresh-btn" onclick="refreshData()">🔄 Refresh Data</button>
+      
       <div class="group-title">CONTROLLER STATUS</div>
       <table>
         <tr><td class="label">MCP23017</td><td class="value">)rawliteral" + String(mcp_available ? "Verbonden" : "Niet gevonden") + R"rawliteral(</td></tr>
@@ -487,29 +642,89 @@ String getMainPage() {
       <table>
         <tr><td class="label">Max request</td><td class="value">)rawliteral" + String(vent_percent) + " %" + R"rawliteral(</td></tr>
       </table>
+      
       <div class="group-title">CIRCUITS</div>
-      <table>
-        <tr class="header-row"><td class="label">#</td><td class="value">Naam</td><td class="value">IP</td><td class="value">mDNS</td><td class="value">TSTAT</td><td class="value">Pomp</td><td class="value">Vermogen</td><td class="value">Vent %</td><td class="value">Duty %</td></tr>
+      <div class="circuits-table-wrapper">
+      <table id="circuits-table">
+        <tr class="header-row">
+          <td>#</td>
+          <td>Naam</td>
+          <td>IP</td>
+          <td>mDNS</td>
+          <td>Set</td>
+          <td>Temp</td>
+          <td>Heat</td>
+          <td>Home</td>
+          <td>TSTAT</td>
+          <td>Pomp</td>
+          <td>P</td>
+          <td>Duty</td>
+          <td>Vent</td>
+          <td>Override</td>
+        </tr>
 )rawliteral";
-  
+
   for (int i = 0; i < circuits_num; i++) {
-    // IP status
+    String row_class = circuits[i].override_active ? " class=\"override-active\"" : "";
+    html += "<tr" + row_class + " data-circuit=\"" + String(i) + "\">";
+    
+    html += "<td class=\"label\">" + String(i + 1) + "</td>";
+    html += "<td class=\"value\">" + circuits[i].name + "</td>";
+    
+    // IP
     String ip_status = "-";
     String ip_class = "";
     if (circuits[i].ip.length() > 0) {
       ip_status = circuits[i].online ? "✓" : "✗";
       ip_class = circuits[i].online ? "status-ok" : "status-na";
     }
+    html += "<td class=\"value " + ip_class + "\">" + ip_status + "</td>";
     
-    // mDNS status
+    // mDNS
     String mdns_status = "-";
     String mdns_class = "";
     if (circuits[i].mdns.length() > 0) {
       mdns_status = circuits[i].online ? "✓" : "✗";
       mdns_class = circuits[i].online ? "status-ok" : "status-na";
     }
+    html += "<td class=\"value " + mdns_class + "\">" + mdns_status + "</td>";
     
-    // TSTAT status
+    // Setpoint
+    String setpoint_str = circuits[i].online && circuits[i].setpoint > 0 
+      ? String(circuits[i].setpoint) + "°C" 
+      : "--";
+    html += "<td class=\"value\">" + setpoint_str + "</td>";
+    
+    // Room Temp
+    String temp_str = circuits[i].online && circuits[i].room_temp > 0.0 
+      ? String(circuits[i].room_temp, 1) + "°C" 
+      : "--";
+    html += "<td class=\"value\">" + temp_str + "</td>";
+    
+    // Heat
+    String heat_str = circuits[i].online 
+      ? (circuits[i].heat_request ? "ON" : "OFF")
+      : "--";
+    html += "<td class=\"value\">" + heat_str + "</td>";
+    
+    // Home
+    String home_str = "--";
+    String home_class = "";
+    if (circuits[i].online) {
+      if (circuits[i].home_status == 1) {
+        home_str = "Thuis";
+        home_class = "status-ok";
+      } else {
+        home_str = "Away";
+        home_class = "status-away";
+      }
+    } else {
+      home_str = "NA";
+      home_class = "status-na";
+    }
+    html += "<td class=\"value " + home_class + "\">" + home_str + "</td>";
+    
+    // TSTAT
     String tstat_status = "-";
     String tstat_class = "";
     if (circuits[i].has_tstat && circuits[i].tstat_pin < 13 && mcp_available) {
@@ -519,32 +734,157 @@ String getMainPage() {
     } else if (circuits[i].has_tstat) {
       tstat_status = "?";
     }
-    
-    String pump = circuits[i].heating_on ? "AAN" : "UIT";
-    String power = circuits[i].heating_on ? String(circuits[i].power_kw, 1) + " kW" : "0 kW";
-    
-    html += "<tr><td class=\"label\">" + String(i + 1) + "</td>";
-    html += "<td class=\"value\">" + circuits[i].name + "</td>";
-    html += "<td class=\"value " + ip_class + "\">" + ip_status + "</td>";
-    html += "<td class=\"value " + mdns_class + "\">" + mdns_status + "</td>";
     html += "<td class=\"value " + tstat_class + "\">" + tstat_status + "</td>";
-    html += "<td class=\"value\">" + pump + "</td>";
+    
+    // Pomp
+    String pump = circuits[i].heating_on ? "<b>AAN</b>" : "UIT";
+    if (circuits[i].override_active) {
+      pump = "⚠️ " + pump;
+    }
+    html += "<td class=\"value pump-status\">" + pump + "</td>";
+    
+    // Power
+    String power = circuits[i].heating_on ? String(circuits[i].power_kw, 1) + " kW" : "0 kW";
     html += "<td class=\"value\">" + power + "</td>";
-    html += "<td class=\"value\">" + String(circuits[i].vent_request) + " %</td>";
-    html += "<td class=\"value\">" + String(circuits[i].duty_cycle, 1) + " %</td></tr>";
+    
+    // Duty
+    html += "<td class=\"value\">" + String(circuits[i].duty_cycle, 1) + "%</td>";
+    
+    // Vent
+    html += "<td class=\"value\">" + String(circuits[i].vent_request) + "%</td>";
+    
+    // Override controls
+    html += "<td class=\"value override-cell\">";
+    if (circuits[i].override_active) {
+      unsigned long elapsed = millis() - circuits[i].override_start;
+      unsigned long remaining = (3600000UL - elapsed) / 1000;
+      if (remaining > 0) {
+        String state_str = circuits[i].override_state ? "ON" : "OFF";
+        html += "<span class=\"override-badge timer\" data-remaining=\"" + String(remaining) + "\">" + state_str + " " + String(remaining / 60) + ":" + String(remaining % 60) + "</span> ";
+        html += "<button class=\"btn-override btn-override-cancel\" onclick=\"cancelOverride(" + String(i) + ")\">×</button>";
+      }
+    } else {
+      html += "<button class=\"btn-override\" onclick=\"setOverride(" + String(i) + ", true)\">ON</button> ";
+      html += "<button class=\"btn-override\" onclick=\"setOverride(" + String(i) + ", false)\">OFF</button>";
+    }
+    html += "</td>";
+    
+    html += "</tr>";
   }
   
   html += R"rawliteral(
-        <tr style="border-top:2px solid #336699;"><td colspan="5" class="label"><b>TOTAAL</b></td>
-        <td class="value"></td>
-        <td class="value"><b>)rawliteral" + String(total_power, 1) + " kW" + R"rawliteral(</b></td>
-        <td class="value"><b>)rawliteral" + String(vent_percent) + " %" + R"rawliteral(</b></td>
-        <td class="value"></td></tr>
+        <tr style="border-top:2px solid #336699;">
+          <td colspan="9" class="label"><b>TOTAAL</b></td>
+          <td class="value"></td>
+          <td class="value"><b>)rawliteral" + String(total_power, 1) + " kW" + R"rawliteral(</b></td>
+          <td class="value"></td>
+          <td class="value"><b>)rawliteral" + String(vent_percent) + " %" + R"rawliteral(</b></td>
+          <td class="value"></td>
+        </tr>
       </table>
+      </div>
 
       <p style="text-align:center;margin-top:30px;"><a href="/settings" style="color:#336699;text-decoration:underline;font-size:16px;">→ Instellingen</a></p>
     </div>
   </div>
+
+<script>
+// Override functies met directe feedback
+function setOverride(circuit, state) {
+  const endpoint = state ? '/circuit_override_on' : '/circuit_override_off';
+  const row = document.querySelector(`tr[data-circuit="${circuit}"]`);
+  const cell = row.querySelector('.override-cell');
+  
+  // Disable buttons meteen
+  cell.querySelectorAll('button').forEach(btn => btn.disabled = true);
+  
+  fetch(endpoint + '?circuit=' + circuit)
+    .then(response => {
+      if (response.ok) {
+        // Direct visuele feedback
+        const stateStr = state ? 'ON' : 'OFF';
+        cell.innerHTML = `<span class="override-badge timer" data-remaining="3600">${stateStr} 60:00</span> <button class="btn-override btn-override-cancel" onclick="cancelOverride(${circuit})">×</button>`;
+        row.classList.add('override-active');
+        
+        // Update pomp status direct
+        const pumpCell = row.querySelector('.pump-status');
+        pumpCell.innerHTML = state ? '⚠️ <b>AAN</b>' : '⚠️ UIT';
+        
+        // Start countdown timer
+        startTimer();
+        
+        // Full refresh na 2 sec voor zekerheid
+        setTimeout(refreshData, 2000);
+      }
+    })
+    .catch(err => {
+      console.error('Override error:', err);
+      cell.querySelectorAll('button').forEach(btn => btn.disabled = false);
+    });
+}
+
+function cancelOverride(circuit) {
+  const row = document.querySelector(`tr[data-circuit="${circuit}"]`);
+  const cell = row.querySelector('.override-cell');
+  
+  fetch('/circuit_override_cancel?circuit=' + circuit)
+    .then(response => {
+      if (response.ok) {
+        // Direct visuele feedback
+        cell.innerHTML = `<button class="btn-override" onclick="setOverride(${circuit}, true)">ON</button> <button class="btn-override" onclick="setOverride(${circuit}, false)">OFF</button>`;
+        row.classList.remove('override-active');
+        
+        // Update pomp status
+        const pumpCell = row.querySelector('.pump-status');
+        pumpCell.innerHTML = 'UIT';
+        
+        // Full refresh na 1 sec
+        setTimeout(refreshData, 1000);
+      }
+    })
+    .catch(err => console.error('Cancel error:', err));
+}
+
+// Countdown timer voor override badges
+function startTimer() {
+  setInterval(() => {
+    document.querySelectorAll('.timer').forEach(badge => {
+      let remaining = parseInt(badge.dataset.remaining);
+      if (remaining > 0) {
+        remaining--;
+        badge.dataset.remaining = remaining;
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        const oldText = badge.textContent;
+        const state = oldText.split(' ')[0];
+        badge.textContent = `${state} ${mins}:${secs.toString().padStart(2, '0')}`;
+      } else {
+        refreshData();
+      }
+    });
+  }, 1000);
+}
+
+// Refresh functie die data update zonder scroll positie te verliezen
+function refreshData() {
+  fetch('/json?' + new Date().getTime())
+    .then(r => r.json())
+    .then(data => {
+      // Update header tijd
+      const now = new Date();
+      document.getElementById('header-time').textContent = 
+        data.timestamp + ' s   ' + now.toLocaleDateString('nl-BE') + ' ' + now.toLocaleTimeString('nl-BE');
+      
+      // Update circuit data (vereenvoudigd - kan uitgebreid worden)
+      console.log('Data refreshed', data);
+    })
+    .catch(err => console.error('Refresh error:', err));
+}
+
+// Start timer bij page load
+window.addEventListener('load', startTimer);
+</script>
+
 </body>
 </html>
 )rawliteral";
@@ -921,6 +1261,44 @@ server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
   delay(2000);
   ESP.restart();
 });
+
+  // === OVERRIDE ENDPOINTS ===
+  server.on("/circuit_override_on", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasArg("circuit")) {
+      int idx = request->arg("circuit").toInt();
+      if (idx >= 0 && idx < circuits_num) {
+        circuits[idx].override_active = true;
+        circuits[idx].override_state = true;  // FORCE ON
+        circuits[idx].override_start = millis();
+        Serial.printf("Circuit %d: Override FORCE ON activated\n", idx);
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/circuit_override_off", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasArg("circuit")) {
+      int idx = request->arg("circuit").toInt();
+      if (idx >= 0 && idx < circuits_num) {
+        circuits[idx].override_active = true;
+        circuits[idx].override_state = false;  // FORCE OFF
+        circuits[idx].override_start = millis();
+        Serial.printf("Circuit %d: Override FORCE OFF activated\n", idx);
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/circuit_override_cancel", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasArg("circuit")) {
+      int idx = request->arg("circuit").toInt();
+      if (idx >= 0 && idx < circuits_num) {
+        circuits[idx].override_active = false;
+        Serial.printf("Circuit %d: Override cancelled\n", idx);
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
 
   server.begin();
 }
