@@ -1,43 +1,28 @@
-/* ESP32C6_HVACTEST.ino = Centrale HVAC controller voor kelder (ESP32-C6) op basis van particle sketch voor Flobecq
+/* ESP32C6_HVAC.ino = Centrale HVAC controller voor kelder (ESP32-C6) op basis van particle sketch voor Flobecq
 Transition from Photon based to ESP32 based Home automation system. Developed together with ChatGPT & Grok in januari '26.
 Thuis bereikbaar op http://hvactest.local of http://192.168.1.36 => Andere controller: Naam (sectie DNS/MDNS) + static IP aanpassen!
 
 10jan26 08:30 Version V52: UI & JSON Improvements: "TRY1"
 10jan26 10:50 Version V52: UI & JSON Improvements: "TRY2"
+11jan26 12:00 Version V53: JSON formaat EXACT zoals Particle Photon
+11jan26 18:00 Version V53.1: ECO logica + UI fixes
 
-✅ Terminologie aangepast (SCH=Warmtepomp schuur, ECO=Solar+Haarden)
-✅ SCH pomp verplaatst naar ECO sectie
-✅ Beide pompen als toggles (zoals circuit relais)
-✅ 2px lijnen tussen alle secties
-✅ ECO data toegevoegd (EAv, EQtot, ET, EB)
-✅ Default boiler volume: 50L (was 100L)
-✅ JSON formaat zoals Particle (korte labels)
-✅ Laatste pompwerking in NVS + UI
+WIJZIGINGEN V53.1 t.o.v. V53:
 
-✅ Pompwerking wordt nu opgeslagen via savePumpEvent() (regel 24-28)
-✅ JSON formaat gebruikt nu korte Particle-stijl labels (KSTopH, KSTopL, KSAv, KSQtot, EAv, EQtot, ET, EB)
-✅ ECO boiler data (EAv, EQtot, ET, EB) toegevoegd aan JSON output (regels 352-355)
-
-✅ "SCH BOILER (Warmtepomp schuur)" - terminologie aangepast
-✅ "ECO BOILER (Solar + Haarden)" - terminologie aangepast
-✅ "Boiler sensors" header met blauwe achtergrond
-✅ "Energieinhoud (QTot)" label
-✅ SCH en WON pompen als toggles (zoals circuit relais)
-✅ 2px section dividers tussen alle secties
-
-✅ Pomp endpoints aangepast: Nu /pump_sch_on, /pump_sch_off, /pump_won_on, /pump_won_off (voor toggles in plaats van 1-minuut timers)
-✅ Settings page blijft hetzelfde (werkt prima!)
-✅ Alle override endpoints voor circuits
-✅ Factory reset functie
-
-✅ Load last pump events uit NVS (regels 78-81)
-✅ Print pump events bij startup (regels 88-93)
-✅ Default boiler volume 50L (regel 74)
-✅ Verbeterde startup messages met V52 features
-
+1.  ECO UI: ETop (hoogste temp) tonen ipv EAv (gemiddelde)
+2.  ECO UI: Alle 4 velden altijd tonen (NA als offline)
+3.  ECO UI: "OFFLINE" uit blauwe balk verwijderen
+4.  Pomp controls: ON/OFF buttons (niet toggles)
+5.  Pomp logica: START = temp_top > max OR qtot > threshold
+6.  Pomp logica: STOP = temp_top < min OR qtot < (threshold-hyst)
+7.  Pomp flow: 30 min pompen -> 30 min wacht -> wissel
+8.  Pomp tracking: Totalen per boiler (cumulatief in NVS)
+9.  Pomp UI: Laatste event + TOTAAL tonen
+10. WiFi: timeout 10s -> 20s (iPhone hotspot)
 
 To do Later:
 - mDNS werkt niet 100% betrouwbaar op ESP32-C6 (maar IP adressen werken prima)
+- Captive Portal: Na AP opstart moet config pagina automatisch openen: http://192.168.4.1/settings
 */
 
 
@@ -82,12 +67,15 @@ const char* NVS_POLL_INTERVAL = "poll_interval";
 const char* NVS_ECO_IP = "eco_ip";
 const char* NVS_ECO_MDNS = "eco_mdns";
 const char* NVS_ECO_MIN_TEMP = "eco_min_temp";
+const char* NVS_ECO_MAX_TEMP = "eco_max_temp";
 const char* NVS_BOILER_REF_TEMP = "boil_ref_t";
 const char* NVS_BOILER_VOLUME = "boil_vol";
 const char* NVS_LAST_SCH_PUMP = "last_sch_pump";
 const char* NVS_LAST_WON_PUMP = "last_won_pump";
 const char* NVS_LAST_SCH_KWH = "last_sch_kwh";
 const char* NVS_LAST_WON_KWH = "last_won_kwh";
+const char* NVS_TOTAL_SCH_KWH = "tot_sch_kwh";  // V53.1: NIEUW - Cumulatief totaal
+const char* NVS_TOTAL_WON_KWH = "tot_won_kwh";  // V53.1: NIEUW - Cumulatief totaal
 
 // Structs
 struct Circuit {
@@ -143,8 +131,9 @@ int poll_interval = 10;
 String eco_controller_ip = "";
 String eco_controller_mdns = "eco";
 float eco_min_temp = 60.0;
+float eco_max_temp = 80.0;
 float boiler_ref_temp = 20.0;
-float boiler_layer_volume = 50.0;  // CHANGED: Was 100L, now 50L
+float boiler_layer_volume = 50.0;
 
 #define RELAY_PUMP_SCH 8
 #define RELAY_PUMP_WON 9
@@ -162,13 +151,20 @@ EcoBoilerData eco_boiler = {false, 0.0, 0.0, 0.0, 0.0, 0};
 PumpEvent last_sch_pump = {0, 0.0};
 PumpEvent last_won_pump = {0, 0.0};
 
-enum EcoPumpState { ECO_IDLE, ECO_PUMP_SCH, ECO_WAIT_SCH, ECO_PUMP_WON, ECO_WAIT_WON };
+// V53.1: Cumulatieve totalen (persistent in NVS)
+float total_sch_kwh = 0.0;
+float total_won_kwh = 0.0;
+
+// V53.1: NIEUWE pomp state machine (vereenvoudigd)
+enum EcoPumpState { ECO_IDLE, ECO_PUMP_SCH, ECO_PUMP_WON, ECO_WAIT };
 EcoPumpState eco_pump_state = ECO_IDLE;
 unsigned long eco_pump_timer = 0;
-unsigned long eco_pump_cycle_start = 0;
-const unsigned long ECO_PUMP_DURATION = 30000UL;
-const unsigned long ECO_WAIT_DURATION = 30000UL;
-const unsigned long ECO_MAX_CYCLE = 300000UL;
+bool last_pump_was_sch = false;  // V53.1: Voor afwisselen
+
+// V53.1: NIEUWE tijdconstanten (30 minuten!)
+const unsigned long ECO_PUMP_DURATION = 30 * 60 * 1000UL;  // 30 min pompen
+const unsigned long ECO_WAIT_DURATION = 30 * 60 * 1000UL;  // 30 min wachten
+// ECO_MAX_CYCLE verwijderd - onbeperkt zolang condities voldaan
 
 bool sch_pump_manual = false;
 bool won_pump_manual = false;
@@ -358,30 +354,36 @@ void pollEcoBoiler() {
   client.stop();
 }
 
+// V53.1: AANGEPAST - Update ook totalen
 void savePumpEvent(const char* pump_type, float kwh) {
   unsigned long timestamp = millis() / 1000;
   
   if (String(pump_type) == "SCH") {
     last_sch_pump.timestamp = timestamp;
     last_sch_pump.kwh_pumped = kwh;
+    total_sch_kwh += kwh;  // V53.1: Update totaal
     preferences.putULong(NVS_LAST_SCH_PUMP, timestamp);
     preferences.putFloat(NVS_LAST_SCH_KWH, kwh);
-    Serial.printf("Saved SCH pump event: %.2f kWh\n", kwh);
+    preferences.putFloat(NVS_TOTAL_SCH_KWH, total_sch_kwh);  // V53.1: Save totaal
+    Serial.printf("Saved SCH pump event: %.2f kWh (totaal: %.2f kWh)\n", kwh, total_sch_kwh);
   } else if (String(pump_type) == "WON") {
     last_won_pump.timestamp = timestamp;
     last_won_pump.kwh_pumped = kwh;
+    total_won_kwh += kwh;  // V53.1: Update totaal
     preferences.putULong(NVS_LAST_WON_PUMP, timestamp);
     preferences.putFloat(NVS_LAST_WON_KWH, kwh);
-    Serial.printf("Saved WON pump event: %.2f kWh\n", kwh);
+    preferences.putFloat(NVS_TOTAL_WON_KWH, total_won_kwh);  // V53.1: Save totaal
+    Serial.printf("Saved WON pump event: %.2f kWh (totaal: %.2f kWh)\n", kwh, total_won_kwh);
   }
 }
 
-
 // ============== DEEL 2/5: ECO PUMPS & POLLING FUNCTIES ==============
 
+// V53.1: VOLLEDIG HERSCHREVEN handleEcoPumps()
 void handleEcoPumps() {
   if (!mcp_available) return;
   
+  // Manual mode heeft prioriteit
   bool sch_manual_active = sch_pump_manual && (millis() - sch_pump_manual_start < MANUAL_PUMP_DURATION);
   bool won_manual_active = won_pump_manual && (millis() - won_pump_manual_start < MANUAL_PUMP_DURATION);
   
@@ -393,73 +395,128 @@ void handleEcoPumps() {
     return;
   }
   
-  bool can_pump = eco_boiler.online && eco_boiler.temp_avg >= eco_min_temp && eco_boiler.qtot > eco_threshold;
+  // V53.1: NIEUWE START conditie (OR logica)
+  bool should_start = eco_boiler.online 
+                   && ((eco_boiler.temp_top > eco_max_temp) || (eco_boiler.qtot > eco_threshold));
   
-  if (!can_pump || eco_boiler.qtot <= (eco_threshold - eco_hysteresis)) {
-    if (eco_pump_state != ECO_IDLE) {
-      Serial.println("ECO: Stopping auto pump cycle");
-      
-      float kwh_transferred = 0.5;
-      if (eco_pump_state == ECO_PUMP_SCH || eco_pump_state == ECO_WAIT_SCH) {
-        savePumpEvent("SCH", kwh_transferred);
-      } else if (eco_pump_state == ECO_PUMP_WON || eco_pump_state == ECO_WAIT_WON) {
-        savePumpEvent("WON", kwh_transferred);
-      }
-      
-      eco_pump_state = ECO_IDLE;
-      mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
-      mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
-    }
-    return;
-  }
+  // V53.1: NIEUWE STOP conditie (OR logica)
+  bool should_stop = !eco_boiler.online
+                  || ((eco_boiler.temp_top < eco_min_temp) || (eco_boiler.qtot < (eco_threshold - eco_hysteresis)));
   
-  if (eco_pump_state != ECO_IDLE && (millis() - eco_pump_cycle_start) > ECO_MAX_CYCLE) {
-    Serial.println("ECO: Max cycle time (5 min) - stopping");
-    eco_pump_state = ECO_IDLE;
-    mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
-    mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
-    return;
-  }
-  
+  // State machine
   switch (eco_pump_state) {
     case ECO_IDLE:
-      Serial.printf("ECO: Starting auto pump cycle\n");
-      eco_pump_state = ECO_PUMP_SCH;
-      eco_pump_timer = millis();
-      eco_pump_cycle_start = millis();
+      // Beide pompen uit
+      mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
+      mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
+      
+      // Check of we moeten starten
+      if (should_start) {
+        // V53.1: Wissel tussen WON en SCH
+        if (last_pump_was_sch) {
+          eco_pump_state = ECO_PUMP_WON;
+          Serial.println("ECO: Starting WON pump (30 min)");
+        } else {
+          eco_pump_state = ECO_PUMP_SCH;
+          Serial.println("ECO: Starting SCH pump (30 min)");
+        }
+        eco_pump_timer = millis();
+      }
       break;
+      
     case ECO_PUMP_SCH:
+      // SCH pompt, WON uit
       mcp.digitalWrite(RELAY_PUMP_SCH, LOW);
       mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
-      if (millis() - eco_pump_timer >= ECO_PUMP_DURATION) {
-        eco_pump_state = ECO_WAIT_SCH;
-        eco_pump_timer = millis();
+      
+      // Check stop conditie
+      if (should_stop) {
+        Serial.println("ECO: Stopping SCH pump (conditie bereikt)");
+        eco_pump_state = ECO_IDLE;
         mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
+        
+        // Save event
+        float kwh_transferred = 0.5;  // TODO: Echte berekening
+        savePumpEvent("SCH", kwh_transferred);
+        last_pump_was_sch = true;
+        break;
       }
-      break;
-    case ECO_WAIT_SCH:
-      mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
-      mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
-      if (millis() - eco_pump_timer >= ECO_WAIT_DURATION) {
-        eco_pump_state = ECO_PUMP_WON;
+      
+      // Check timeout (30 min)
+      if (millis() - eco_pump_timer >= ECO_PUMP_DURATION) {
+        Serial.println("ECO: SCH pump finished (30 min)");
+        mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
+        
+        // Save event
+        float kwh_transferred = 0.5;  // TODO: Echte berekening
+        savePumpEvent("SCH", kwh_transferred);
+        last_pump_was_sch = true;
+        
+        // Ga naar wacht-fase
+        eco_pump_state = ECO_WAIT;
         eco_pump_timer = millis();
       }
       break;
+      
     case ECO_PUMP_WON:
+      // WON pompt, SCH uit
       mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
       mcp.digitalWrite(RELAY_PUMP_WON, LOW);
-      if (millis() - eco_pump_timer >= ECO_PUMP_DURATION) {
-        eco_pump_state = ECO_WAIT_WON;
-        eco_pump_timer = millis();
+      
+      // Check stop conditie
+      if (should_stop) {
+        Serial.println("ECO: Stopping WON pump (conditie bereikt)");
+        eco_pump_state = ECO_IDLE;
         mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
+        
+        // Save event
+        float kwh_transferred = 0.5;  // TODO: Echte berekening
+        savePumpEvent("WON", kwh_transferred);
+        last_pump_was_sch = false;
+        break;
+      }
+      
+      // Check timeout (30 min)
+      if (millis() - eco_pump_timer >= ECO_PUMP_DURATION) {
+        Serial.println("ECO: WON pump finished (30 min)");
+        mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
+        
+        // Save event
+        float kwh_transferred = 0.5;  // TODO: Echte berekening
+        savePumpEvent("WON", kwh_transferred);
+        last_pump_was_sch = false;
+        
+        // Ga naar wacht-fase
+        eco_pump_state = ECO_WAIT;
+        eco_pump_timer = millis();
       }
       break;
-    case ECO_WAIT_WON:
+      
+    case ECO_WAIT:
+      // Beide pompen uit, wachten 30 min
       mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
       mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
+      
+      // Check of we nog moeten wachten
       if (millis() - eco_pump_timer >= ECO_WAIT_DURATION) {
-        eco_pump_state = ECO_PUMP_SCH;
-        eco_pump_timer = millis();
+        Serial.println("ECO: Wait period finished (30 min)");
+        
+        // Check of we weer moeten starten
+        if (should_start) {
+          // Wissel naar andere pomp
+          if (last_pump_was_sch) {
+            eco_pump_state = ECO_PUMP_WON;
+            Serial.println("ECO: Starting WON pump (30 min)");
+          } else {
+            eco_pump_state = ECO_PUMP_SCH;
+            Serial.println("ECO: Starting SCH pump (30 min)");
+          }
+          eco_pump_timer = millis();
+        } else {
+          // Niet meer nodig, terug naar IDLE
+          Serial.println("ECO: No more pumping needed");
+          eco_pump_state = ECO_IDLE;
+        }
       }
       break;
   }
@@ -666,9 +723,11 @@ String getWifiScanJson() {
   return json;
 }
 
+// V53: JSON - ONGEWIJZIGD t.o.v. V53
 String getLogData() {
-  DynamicJsonDocument doc(4096);
-  doc["timestamp"] = millis() / 1000;
+  DynamicJsonDocument doc(2048);
+  
+  doc["eco_online"] = eco_boiler.online ? 1 : 0;
   
   doc["KSTopH"] = sch_temps[0];
   doc["KSTopL"] = sch_temps[1];
@@ -686,57 +745,53 @@ String getLogData() {
     }
   }
   if (valid_count > 0) KSAv /= valid_count;
-  
   doc["KSAv"] = KSAv;
   doc["KSQtot"] = sch_qtot;
   
+  doc["KWTopH"] = 0.0;
+  doc["KWTopL"] = 0.0;
+  doc["KWMidH"] = 0.0;
+  doc["KWMidL"] = 0.0;
+  doc["KWBotH"] = 0.0;
+  doc["KWBotL"] = 0.0;
+  doc["KWAv"] = 0.0;
+  doc["KWQtot"] = 0.0;
+  
   doc["EAv"] = eco_boiler.temp_avg;
   doc["EQtot"] = eco_boiler.qtot;
-  doc["ET"] = eco_boiler.temp_top;
-  doc["EB"] = eco_boiler.temp_bottom;
+  doc["ET"] = eco_max_temp;
+  doc["EB"] = eco_min_temp;
   
-  doc["vent_percent"] = vent_percent;
-  doc["eco_online"] = eco_boiler.online;
-  doc["sch_pump_manual"] = sch_pump_manual;
-  doc["won_pump_manual"] = won_pump_manual;
+  doc["BB"] = (int)circuits[0].duty_cycle;
+  doc["WP"] = (int)circuits[1].duty_cycle;
+  doc["BK"] = (int)circuits[2].duty_cycle;
+  doc["ZP"] = (int)circuits[3].duty_cycle;
+  doc["EP"] = (int)circuits[4].duty_cycle;
+  doc["KK"] = (int)circuits[5].duty_cycle;
+  doc["IK"] = (int)circuits[6].duty_cycle;
   
-  if (sch_pump_manual) {
-    doc["sch_pump_remaining"] = (MANUAL_PUMP_DURATION - (millis() - sch_pump_manual_start)) / 1000;
-  }
-  if (won_pump_manual) {
-    doc["won_pump_remaining"] = (MANUAL_PUMP_DURATION - (millis() - won_pump_manual_start)) / 1000;
-  }
+  doc["R1"] = circuits[0].heating_on ? 1 : 0;
+  doc["R2"] = circuits[1].heating_on ? 1 : 0;
+  doc["R3"] = circuits[2].heating_on ? 1 : 0;
+  doc["R4"] = circuits[3].heating_on ? 1 : 0;
+  doc["R5"] = circuits[4].heating_on ? 1 : 0;
+  doc["R6"] = circuits[5].heating_on ? 1 : 0;
+  doc["R7"] = circuits[6].heating_on ? 1 : 0;
   
-  JsonArray circs = doc.createNestedArray("circuits");
+  doc["R9"] = (sch_pump_manual || (mcp_available && mcp.digitalRead(RELAY_PUMP_SCH) == LOW)) ? 1 : 0;
+  doc["R10"] = (won_pump_manual || (mcp_available && mcp.digitalRead(RELAY_PUMP_WON) == LOW)) ? 1 : 0;
+  
+  float total_power = 0.0;
   for (int i = 0; i < circuits_num; i++) {
-    JsonObject c = circs.createNestedObject();
-    c["id"] = i + 1;
-    c["name"] = circuits[i].name;
-    c["online"] = circuits[i].online;
-    c["heating_on"] = circuits[i].heating_on;
-    c["power_kw"] = circuits[i].power_kw;
-    c["duty_cycle"] = circuits[i].duty_cycle;
-    c["vent_request"] = circuits[i].vent_request;
-    
-    if (circuits[i].online) {
-      c["setpoint"] = circuits[i].setpoint;
-      c["room_temp"] = circuits[i].room_temp;
-      c["heat_request"] = circuits[i].heat_request;
-      c["home_status"] = circuits[i].home_status;
-    }
-    
-    if (circuits[i].override_active) {
-      c["override_active"] = true;
-      c["override_state"] = circuits[i].override_state;
-      c["override_remaining"] = (600000UL - (millis() - circuits[i].override_start)) / 1000;
-    }
+    if (circuits[i].heating_on) total_power += circuits[i].power_kw;
   }
+  doc["HeatDem"] = total_power;
+  doc["Vent"] = vent_percent;
   
   String json;
   serializeJson(doc, json);
   return json;
 }
-
 
 // ============== DEEL 3/5: MAIN PAGE UI ==============
 
@@ -747,7 +802,7 @@ String getMainPage() {
   }
   
   String html;
-  html.reserve(35000);
+  html.reserve(40000);
   html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="nl">
@@ -762,12 +817,11 @@ String getMainPage() {
     .header-right {flex:1;text-align:right;font-size:15px;}
     .container {display:flex;min-height:calc(100vh - 60px);}
     .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
-    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;margin:0 auto;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;margin:8px auto;}
     .sidebar a:hover {background:#036;}
     .sidebar a.active {background:#c00;}
     .main {flex:1;padding:15px;overflow-y:auto;}
     .group-title {font-size:17px;font-style:italic;font-weight:bold;color:#fff;background:#336699;padding:8px 12px;margin:20px 0 8px 0;border-radius:4px;}
-    .group-title.eco {background:#0a0;}
     .section-divider {border-top:2px solid #ccc;margin:15px 0;}
     .blue-divider {border-top:3px solid #336699;margin:25px 0;}
     .refresh-btn {background:#369;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;margin:10px 0;width:100%;max-width:300px;}
@@ -780,19 +834,16 @@ String getMainPage() {
     .status-ok {color:#0a0;font-weight:bold;}
     .status-na {color:#c00;font-weight:bold;}
     .status-away {color:#f80;font-weight:bold;}
-    .toggle-container {display:flex;align-items:center;justify-content:center;gap:10px;}
-    .toggle-switch {position:relative;display:inline-block;width:50px;height:24px;}
-    .toggle-switch input {opacity:0;width:0;height:0;}
-    .toggle-slider {position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.3s;border-radius:24px;}
-    .toggle-slider:before {position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background-color:#fff;transition:.3s;border-radius:50%;}
-    input:checked + .toggle-slider {background-color:#0a0;}
-    input:checked + .toggle-slider:before {transform:translateX(26px);}
-    input:disabled + .toggle-slider {background-color:#ddd;cursor:not-allowed;}
-    .toggle-label {font-size:12px;color:#369;font-weight:bold;min-width:60px;}
-    .pump-info {font-size:11px;color:#666;font-style:italic;margin-top:5px;}
     .eco-status-badge {display:inline-block;padding:4px 12px;border-radius:4px;font-weight:bold;font-size:12px;margin-left:10px;}
     .eco-online {background:#0a0;color:#fff;}
     .eco-offline {background:#c00;color:#fff;}
+    .pump-controls {display:flex;gap:8px;justify-content:center;align-items:center;margin:8px 0;}
+    .pump-btn {background:#369;color:#fff;padding:6px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;}
+    .pump-btn:hover {background:#036;}
+    .pump-btn.off {background:#c00;}
+    .pump-btn.off:hover {background:#900;}
+    .pump-info {font-size:11px;color:#666;font-style:italic;margin-top:5px;text-align:center;}
+    .pump-total {font-size:12px;color:#369;font-weight:bold;margin-top:3px;text-align:center;}
     .circuits-table-wrapper {overflow-x:auto;-webkit-overflow-scrolling:touch;border:2px solid #ddd;border-radius:8px;margin:15px 0;}
     table.circuits-table {min-width:1400px;}
     tr.override-active {border-left:4px solid #c00;}
@@ -859,7 +910,7 @@ String getMainPage() {
 
       <div class="blue-divider"></div>
 
-      <div class="group-title eco">ECO BOILER (Solar + Haarden)
+      <div class="group-title">ECO BOILER (Solar + Haarden)
         <span class="eco-status-badge )rawliteral";
   html += (eco_boiler.online ? "eco-online" : "eco-offline");
   html += R"rawliteral(">)rawliteral";
@@ -867,56 +918,49 @@ String getMainPage() {
   html += R"rawliteral(</span>
       </div>
       <table>
-)rawliteral";
-
-  if (eco_boiler.online) {
-    html += R"rawliteral(
         <tr>
-          <td class="label">EAv (Gem. temp)</td>
-          <td class="value"><span class="status-ok"><b>)rawliteral";
-    html += String(eco_boiler.temp_avg, 1) + " &deg;C";
-    html += R"rawliteral(</b></span></td>
+          <td class="label">ETop (Hoogste temp)</td>
+          <td class="value">)rawliteral";
+  
+  // V53.1: ALTIJD tonen, NA als offline
+  if (eco_boiler.online) {
+    html += "<span class=\"status-ok\"><b>" + String(eco_boiler.temp_top, 1) + " &deg;C</b></span>";
+  } else {
+    html += "<span class=\"status-na\">NA</span>";
+  }
+  
+  html += R"rawliteral(</td>
         </tr>
         <tr>
           <td class="label">EQtot (Energie)</td>
-          <td class="value"><span class="status-ok"><b>)rawliteral";
-    html += String(eco_boiler.qtot, 2) + " kWh";
-    html += R"rawliteral(</b></span></td>
-        </tr>
-        <tr>
-          <td class="label">ET (Top temp)</td>
           <td class="value">)rawliteral";
-    html += String(eco_boiler.temp_top, 1) + " &deg;C";
-    html += R"rawliteral(</td>
-        </tr>
-        <tr>
-          <td class="label">EB (Bodem temp)</td>
-          <td class="value">)rawliteral";
-    html += String(eco_boiler.temp_bottom, 1) + " &deg;C";
-    html += R"rawliteral(</td>
-        </tr>
-)rawliteral";
+  
+  if (eco_boiler.online) {
+    html += "<span class=\"status-ok\"><b>" + String(eco_boiler.qtot, 2) + " kWh</b></span>";
   } else {
-    html += R"rawliteral(
-        <tr>
-          <td class="label">Status</td>
-          <td class="value"><span class="status-na"><b>OFFLINE - Geen data</b></span></td>
-        </tr>
-)rawliteral";
+    html += "<span class=\"status-na\">NA</span>";
   }
   
-  html += R"rawliteral(
+  html += R"rawliteral(</td>
+        </tr>
+        <tr>
+          <td class="label">ET (Tmax pomp)</td>
+          <td class="value">)rawliteral";
+  html += String(eco_max_temp, 1) + " &deg;C";
+  html += R"rawliteral(</td>
+        </tr>
+        <tr>
+          <td class="label">EB (Tmin pomp)</td>
+          <td class="value">)rawliteral";
+  html += String(eco_min_temp, 1) + " &deg;C";
+  html += R"rawliteral(</td>
+        </tr>
         <tr>
           <td class="label">SCH Pomp</td>
           <td class="value">
-            <div class="toggle-container">
-              <span class="toggle-label">SCH</span>
-              <label class="toggle-switch">
-                <input type="checkbox" id="sch_pump_toggle" onchange="togglePump('sch', this.checked)" )rawliteral";
-  html += (sch_pump_manual ? "checked" : "");
-  html += R"rawliteral(>
-                <span class="toggle-slider"></span>
-              </label>
+            <div class="pump-controls">
+              <button class="pump-btn" onclick="pumpControl('sch','on')">ON</button>
+              <button class="pump-btn off" onclick="pumpControl('sch','off')">OFF</button>
             </div>
 )rawliteral";
   
@@ -926,10 +970,12 @@ String getMainPage() {
     localtime_r(&event_time, &tm);
     char time_buf[32];
     strftime(time_buf, sizeof(time_buf), "%d-%m-%Y %H:%M", &tm);
-    html += "            <div class=\"pump-info\">Laatste automatische pompwerking:<br>" + String(time_buf) + " - " + String(last_sch_pump.kwh_pumped, 2) + " kWh</div>";
+    html += "            <div class=\"pump-info\">Laatste: " + String(time_buf) + " - " + String(last_sch_pump.kwh_pumped, 2) + " kWh</div>";
   } else {
-    html += "            <div class=\"pump-info\">Laatste automatische pompwerking: NA</div>";
+    html += "            <div class=\"pump-info\">Laatste: NA</div>";
   }
+  
+  html += "            <div class=\"pump-total\">TOTAAL: " + String(total_sch_kwh, 1) + " kWh</div>";
   
   html += R"rawliteral(
           </td>
@@ -937,14 +983,9 @@ String getMainPage() {
         <tr>
           <td class="label">WON Pomp</td>
           <td class="value">
-            <div class="toggle-container">
-              <span class="toggle-label">WON</span>
-              <label class="toggle-switch">
-                <input type="checkbox" id="won_pump_toggle" onchange="togglePump('won', this.checked)" )rawliteral";
-  html += (won_pump_manual ? "checked" : "");
-  html += R"rawliteral(>
-                <span class="toggle-slider"></span>
-              </label>
+            <div class="pump-controls">
+              <button class="pump-btn" onclick="pumpControl('won','on')">ON</button>
+              <button class="pump-btn off" onclick="pumpControl('won','off')">OFF</button>
             </div>
 )rawliteral";
   
@@ -954,10 +995,12 @@ String getMainPage() {
     localtime_r(&event_time, &tm);
     char time_buf[32];
     strftime(time_buf, sizeof(time_buf), "%d-%m-%Y %H:%M", &tm);
-    html += "            <div class=\"pump-info\">Laatste automatische pompwerking:<br>" + String(time_buf) + " - " + String(last_won_pump.kwh_pumped, 2) + " kWh</div>";
+    html += "            <div class=\"pump-info\">Laatste: " + String(time_buf) + " - " + String(last_won_pump.kwh_pumped, 2) + " kWh</div>";
   } else {
-    html += "            <div class=\"pump-info\">Laatste automatische pompwerking: NA</div>";
+    html += "            <div class=\"pump-info\">Laatste: NA</div>";
   }
+  
+  html += "            <div class=\"pump-total\">TOTAAL: " + String(total_won_kwh, 1) + " kWh</div>";
   
   html += R"rawliteral(
           </td>
@@ -1046,14 +1089,11 @@ String getMainPage() {
   </div>
 
 <script>
-function togglePump(type, state) {
-  const endpoint = state ? (type === 'sch' ? '/pump_sch_on' : '/pump_won_on') 
-                         : (type === 'sch' ? '/pump_sch_off' : '/pump_won_off');
-  fetch(endpoint).then(response => {
-    if (!response.ok) {
-      document.getElementById(type + '_pump_toggle').checked = !state;
-    }
-  });
+function pumpControl(type, action) {
+  const endpoint = type === 'sch' 
+    ? (action === 'on' ? '/pump_sch_on' : '/pump_sch_off')
+    : (action === 'on' ? '/pump_won_on' : '/pump_won_off');
+  fetch(endpoint).then(() => setTimeout(() => location.reload(), 500));
 }
 
 function setOverride(circuit, state) {
@@ -1078,10 +1118,7 @@ setInterval(() => {
 }, 1000);
 
 function refreshData() {
-  fetch('/json?' + Date.now()).then(r => r.json()).then(data => {
-    document.getElementById('header-time').textContent = data.timestamp + ' s   ' + 
-      new Date().toLocaleDateString('nl-BE') + ' ' + new Date().toLocaleTimeString('nl-BE');
-  });
+  location.reload();
 }
 </script>
 </body>
@@ -1090,7 +1127,6 @@ function refreshData() {
   
   return html;
 }
-
 
 // ============== DEEL 4/5: SETTINGS PAGE & ENDPOINTS ==============
 
@@ -1190,7 +1226,7 @@ body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
 .header-right{flex:1;text-align:right;font-size:15px;}
 .container{display:flex;min-height:calc(100vh - 60px);}
 .sidebar{width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
-.sidebar a{display:block;background:#369;color:#fff;padding:8px;margin:8px 0;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;margin:0 auto;}
+.sidebar a{display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
 .sidebar a:hover{background:#036;}
 .sidebar a.active{background:#c00;}
 .main{flex:1;padding:20px;overflow-y:auto;}
@@ -1245,6 +1281,7 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;}
     <tr><td>ECO Threshold (kWh)</td><td><input type="number" step="0.1" name="eco_thresh" value=")rawliteral" + String(eco_threshold) + R"rawliteral(" style="width:100%;"></td></tr>
     <tr><td>ECO Hysteresis (kWh)</td><td><input type="number" step="0.1" name="eco_hyst" value=")rawliteral" + String(eco_hysteresis) + R"rawliteral(" style="width:100%;"></td></tr>
     <tr><td>ECO Min Temp (&deg;C)</td><td><input type="number" step="0.1" name="eco_min_temp" value=")rawliteral" + String(eco_min_temp) + R"rawliteral(" style="width:100%;"></td></tr>
+    <tr><td>ECO Max Temp (&deg;C)</td><td><input type="number" step="0.1" name="eco_max_temp" value=")rawliteral" + String(eco_max_temp) + R"rawliteral(" style="width:100%;"></td></tr>
   </table>
 
   <h2>Boiler Qtot Berekening</h2>
@@ -1284,6 +1321,7 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;}
     if (request->hasArg("eco_thresh")) preferences.putFloat(NVS_ECO_THRESHOLD, request->arg("eco_thresh").toFloat());
     if (request->hasArg("eco_hyst")) preferences.putFloat(NVS_ECO_HYSTERESIS, request->arg("eco_hyst").toFloat());
     if (request->hasArg("eco_min_temp")) preferences.putFloat(NVS_ECO_MIN_TEMP, request->arg("eco_min_temp").toFloat());
+    if (request->hasArg("eco_max_temp")) preferences.putFloat(NVS_ECO_MAX_TEMP, request->arg("eco_max_temp").toFloat());
     if (request->hasArg("boiler_ref_temp")) preferences.putFloat(NVS_BOILER_REF_TEMP, request->arg("boiler_ref_temp").toFloat());
     if (request->hasArg("boiler_volume")) preferences.putFloat(NVS_BOILER_VOLUME, request->arg("boiler_volume").toFloat());
     
@@ -1362,31 +1400,32 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;}
     request->send(200, "text/plain", "OK");
   });
 
+  // V53.1: AANGEPASTE pomp endpoints (instant, geen timers)
   server.on("/pump_sch_on", HTTP_GET, [](AsyncWebServerRequest *request) {
     sch_pump_manual = true;
     sch_pump_manual_start = millis();
-    Serial.println("ECO: SCH pump ON (toggle)");
+    Serial.println("ECO: SCH pump ON (manual)");
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/pump_sch_off", HTTP_GET, [](AsyncWebServerRequest *request) {
     sch_pump_manual = false;
     if (mcp_available) mcp.digitalWrite(RELAY_PUMP_SCH, HIGH);
-    Serial.println("ECO: SCH pump OFF (toggle)");
+    Serial.println("ECO: SCH pump OFF (manual)");
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/pump_won_on", HTTP_GET, [](AsyncWebServerRequest *request) {
     won_pump_manual = true;
     won_pump_manual_start = millis();
-    Serial.println("ECO: WON pump ON (toggle)");
+    Serial.println("ECO: WON pump ON (manual)");
     request->send(200, "text/plain", "OK");
   });
 
   server.on("/pump_won_off", HTTP_GET, [](AsyncWebServerRequest *request) {
     won_pump_manual = false;
     if (mcp_available) mcp.digitalWrite(RELAY_PUMP_WON, HIGH);
-    Serial.println("ECO: WON pump OFF (toggle)");
+    Serial.println("ECO: WON pump OFF (manual)");
     request->send(200, "text/plain", "OK");
   });
 
@@ -1403,23 +1442,23 @@ void factoryResetNVS() {
   ESP.restart();
 }
 
-
 // ============== DEEL 5/5: SETUP & LOOP ==============
-
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== HVAC Controller V52 ===");
-  Serial.println("IMPROVEMENTS:");
-  Serial.println("- Terminologie aangepast (SCH=Warmtepomp schuur, ECO=Solar+Haarden)");
-  Serial.println("- SCH pomp verplaatst naar ECO sectie");
-  Serial.println("- Beide pompen als toggles (zoals circuit relais)");
-  Serial.println("- 2px lijnen tussen alle secties");
-  Serial.println("- ECO data toegevoegd (EAv, EQtot, ET, EB)");
-  Serial.println("- Default boiler volume: 50L (was 100L)");
-  Serial.println("- JSON formaat zoals Particle (korte labels)");
-  Serial.println("- Laatste pompwerking in NVS + UI");
+  Serial.println("\n\n=== HVAC Controller V53.1 ===");
+  Serial.println("WIJZIGINGEN t.o.v. V53:");
+  Serial.println("1.  ECO UI: ETop (hoogste temp) tonen ipv EAv (gemiddelde)");
+  Serial.println("2.  ECO UI: Alle 4 velden altijd tonen (NA als offline)");
+  Serial.println("3.  ECO UI: OFFLINE uit blauwe balk verwijderd");
+  Serial.println("4.  Pomp controls: ON/OFF buttons (niet toggles)");
+  Serial.println("5.  Pomp logica: START = temp_top > max OR qtot > threshold");
+  Serial.println("6.  Pomp logica: STOP = temp_top < min OR qtot < (threshold-hyst)");
+  Serial.println("7.  Pomp flow: 30 min pompen -> 30 min wacht -> wissel");
+  Serial.println("8.  Pomp tracking: Totalen per boiler (cumulatief in NVS)");
+  Serial.println("9.  Pomp UI: Laatste event + TOTAAL tonen");
+  Serial.println("10. WiFi: timeout 10s -> 20s (iPhone hotspot)");
 
   // Factory reset optie
   Serial.println("\nType 'R' binnen 3 sec voor NVS reset...");
@@ -1473,18 +1512,33 @@ void setup() {
   eco_controller_ip = preferences.getString(NVS_ECO_IP, "");
   eco_controller_mdns = preferences.getString(NVS_ECO_MDNS, "eco");
   eco_min_temp = preferences.getFloat(NVS_ECO_MIN_TEMP, 60.0);
+  eco_max_temp = preferences.getFloat(NVS_ECO_MAX_TEMP, 80.0);
   boiler_ref_temp = preferences.getFloat(NVS_BOILER_REF_TEMP, 20.0);
   boiler_layer_volume = preferences.getFloat(NVS_BOILER_VOLUME, 50.0);
   
-  // Load last pump events
+  // V53.1: Load last pump events
   last_sch_pump.timestamp = preferences.getULong(NVS_LAST_SCH_PUMP, 0);
   last_sch_pump.kwh_pumped = preferences.getFloat(NVS_LAST_SCH_KWH, 0.0);
   last_won_pump.timestamp = preferences.getULong(NVS_LAST_WON_PUMP, 0);
   last_won_pump.kwh_pumped = preferences.getFloat(NVS_LAST_WON_KWH, 0.0);
   
+  // V53.1: Load totalen
+  total_sch_kwh = preferences.getFloat(NVS_TOTAL_SCH_KWH, 0.0);
+  total_won_kwh = preferences.getFloat(NVS_TOTAL_WON_KWH, 0.0);
+  
   Serial.printf("\nBoiler Qtot settings:\n");
   Serial.printf("  Reference temp: %.1f °C\n", boiler_ref_temp);
   Serial.printf("  Volume per laag: %.0f L\n", boiler_layer_volume);
+  
+  Serial.printf("\nECO Boiler settings:\n");
+  Serial.printf("  Min temp (Tmin): %.1f °C\n", eco_min_temp);
+  Serial.printf("  Max temp (Tmax): %.1f °C\n", eco_max_temp);
+  Serial.printf("  Threshold: %.1f kWh\n", eco_threshold);
+  Serial.printf("  Hysteresis: %.1f kWh\n", eco_hysteresis);
+  
+  Serial.printf("\nECO Pomp totalen:\n");
+  Serial.printf("  SCH totaal: %.1f kWh\n", total_sch_kwh);
+  Serial.printf("  WON totaal: %.1f kWh\n", total_won_kwh);
   
   if (last_sch_pump.timestamp > 0) {
     Serial.printf("\nLast SCH pump event: %.2f kWh\n", last_sch_pump.kwh_pumped);
@@ -1527,7 +1581,7 @@ void setup() {
     Serial.printf(" [%.3f kW]\n", circuits[i].power_kw);
   }
 
-  // WiFi
+  // V53.1: VERBETERDE WiFi verbinding met 20s timeout per poging
   WiFi.mode(WIFI_STA);
 
   if (static_ip_str.length() > 0 && static_ip.fromString(static_ip_str)) {
@@ -1539,11 +1593,38 @@ void setup() {
 
   if (wifi_ssid.length() > 0) {
     Serial.printf("\nConnecting to '%s'...\n", wifi_ssid.c_str());
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-    unsigned long start_conn = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start_conn < 10000) {
-      delay(500);
-      Serial.print(".");
+    
+    int retry_count = 0;
+    const int MAX_RETRIES = 5;
+    bool connected = false;
+    
+    while (!connected && retry_count < MAX_RETRIES) {
+      WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+      
+      // V53.1: Timeout verhoogd naar 20s (iPhone hotspot)
+      unsigned long start_attempt = millis();
+      while (WiFi.status() != WL_CONNECTED && (millis() - start_attempt) < 20000) {
+        delay(500);
+        Serial.print(".");
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        Serial.println("\n✓ WiFi connected!");
+      } else {
+        retry_count++;
+        Serial.printf("\n✗ Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
+        
+        if (retry_count < MAX_RETRIES) {
+          Serial.println("Disconnecting and retrying...");
+          WiFi.disconnect();
+          delay(2000);  // V53.1: Langere delay (was 1000ms)
+        }
+      }
+    }
+    
+    if (!connected) {
+      Serial.println("\n✗ All WiFi attempts failed -> AP mode");
     }
   }
 
