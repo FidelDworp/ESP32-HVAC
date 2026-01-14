@@ -2024,10 +2024,15 @@ void setup() {
       if (WiFi.status() == WL_CONNECTED) {
         connected = true;
         Serial.println("\n✓ WiFi connected!");
+        
+        // ===== FIX: WiFi power save UIT =====
+        WiFi.setSleep(false);
+        Serial.println("WiFi power save: DISABLED");
+        
       } else {
         retry_count++;
         Serial.printf("\n✗ Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
-        
+
         if (retry_count < MAX_RETRIES) {
           Serial.println("Disconnecting and retrying...");
           WiFi.disconnect();
